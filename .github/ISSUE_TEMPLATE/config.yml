@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Bug reports & feature requests
+    url: https://github.com/SalesforceCommerceCloud/b2c-developer-tooling/issues
+    about: Development of the B2C DX VS Code Extension happens in the b2c-developer-tooling monorepo. File issues there.
+  - name: Security vulnerabilities
+    url: mailto:security@salesforce.com
+    about: Do not file security issues on GitHub. Email security@salesforce.com instead. See SECURITY.md.
