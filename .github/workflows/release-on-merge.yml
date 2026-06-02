@@ -1,0 +1,114 @@
+name: Create release on merge
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'releases/latest.json'
+  workflow_dispatch:
+
+jobs:
+  release:
+    name: Create GitHub release from merged release PR
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Read release marker
+        id: marker
+        run: |
+          if [ ! -f releases/latest.json ]; then
+            echo "::error::releases/latest.json is missing"
+            exit 1
+          fi
+
+          VERSION=$(jq -r '.version // empty' releases/latest.json)
+          MONOREPO_TAG=$(jq -r '.monorepoTag // empty' releases/latest.json)
+          MONOREPO_REPO=$(jq -r '.monorepoRepo // empty' releases/latest.json)
+
+          if [ -z "$VERSION" ] || [ -z "$MONOREPO_TAG" ] || [ -z "$MONOREPO_REPO" ]; then
+            echo "::notice::releases/latest.json has null version/tag/repo (sentinel state); nothing to release"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Skip if version is unchanged from the previous commit (e.g. only metadata edits)
+          PREV=$(git show HEAD~1:releases/latest.json 2>/dev/null | jq -r '.version // empty' || true)
+          if [ "$PREV" = "$VERSION" ]; then
+            echo "::notice::Version unchanged ($VERSION); nothing to release"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          RELEASE_TAG="b2c-vs-extension@${VERSION}"
+
+          # Idempotency: skip if the release already exists in this repo
+          if gh release view "$RELEASE_TAG" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            echo "::notice::Release $RELEASE_TAG already exists; skipping"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "release_tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
+          echo "monorepo_tag=$MONOREPO_TAG" >> "$GITHUB_OUTPUT"
+          echo "monorepo_repo=$MONOREPO_REPO" >> "$GITHUB_OUTPUT"
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+
+      - name: Download VSIX from monorepo release
+        if: steps.marker.outputs.skip != 'true'
+        run: |
+          gh release download "${{ steps.marker.outputs.monorepo_tag }}" \
+            --repo "${{ steps.marker.outputs.monorepo_repo }}" \
+            --pattern '*.vsix' \
+            --dir .
+          VSIX=$(ls *.vsix 2>/dev/null | head -n1)
+          if [ -z "$VSIX" ]; then
+            echo "::error::No .vsix asset found on ${{ steps.marker.outputs.monorepo_repo }}@${{ steps.marker.outputs.monorepo_tag }}"
+            exit 1
+          fi
+          echo "Downloaded $VSIX"
+          echo "VSIX=$VSIX" >> "$GITHUB_ENV"
+
+      - name: Extract changelog section for release notes
+        if: steps.marker.outputs.skip != 'true'
+        run: |
+          awk '
+            /^## / { if (found) exit; found=1; next }
+            found { print }
+          ' CHANGELOG.md > /tmp/release-notes.md
+          {
+            cat <<HEADER
+          ## B2C DX VS Code Extension v${{ steps.marker.outputs.version }}
+
+          Source release: [${{ steps.marker.outputs.monorepo_repo }}@${{ steps.marker.outputs.monorepo_tag }}](https://github.com/${{ steps.marker.outputs.monorepo_repo }}/releases/tag/${{ steps.marker.outputs.monorepo_tag }})
+
+          Install via:
+          \`\`\`
+          code --install-extension b2c-vs-extension-${{ steps.marker.outputs.version }}.vsix
+          \`\`\`
+
+          Or in VS Code: Extensions → ⋯ → Install from VSIX...
+
+          ---
+
+          ### Changelog
+
+          HEADER
+            cat /tmp/release-notes.md
+          } > /tmp/full-release-notes.md
+
+      - name: Create release (fires publish workflows)
+        if: steps.marker.outputs.skip != 'true'
+        run: |
+          gh release create "${{ steps.marker.outputs.release_tag }}" \
+            --repo "${{ github.repository }}" \
+            --title "VS Code Extension ${{ steps.marker.outputs.version }}" \
+            --notes-file /tmp/full-release-notes.md \
+            "$VSIX"

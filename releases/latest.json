@@ -1,0 +1,8 @@
+{
+  "version": null,
+  "monorepoTag": null,
+  "monorepoRepo": "SalesforceCommerceCloud/b2c-developer-tooling",
+  "monorepoReleaseUrl": null,
+  "sha": null,
+  "_note": "This file is rewritten by each release PR opened from the monorepo. The on-merge workflow (.github/workflows/release-on-merge.yml) reads it after a PR merge to know which monorepo release to fetch the VSIX from. The first real release will replace these null fields."
+}
