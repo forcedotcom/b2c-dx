@@ -1,17 +1,49 @@
-# B2C DX VS Code Extension
+<h1 align="center">B2C DX VS Code Extension</h1>
 
-The official Salesforce VS Code extension for **B2C Commerce** developer experience: sandbox realm explorer, cartridge code sync, WebDAV browser, content libraries, SCAPI API browser, B2C Script debugger, scaffold/CAP install, log tailing, and a Page Designer Assistant.
+<p align="center">
+  <strong>The official Salesforce VS Code extension for B2C Commerce developer experience.</strong>
+  <br>
+  Sandbox explorer · Cartridge code sync · WebDAV · Content libraries · SCAPI browser · B2C Script debugger
+</p>
+
+<p align="center">
+  <a href="https://marketplace.visualstudio.com/items?itemName=Salesforce.b2c-vs-extension">
+    <img alt="VS Marketplace version" src="https://img.shields.io/visual-studio-marketplace/v/Salesforce.b2c-vs-extension?label=VS%20Marketplace&color=0066d4">
+  </a>
+  <a href="https://marketplace.visualstudio.com/items?itemName=Salesforce.b2c-vs-extension">
+    <img alt="VS Marketplace installs" src="https://img.shields.io/visual-studio-marketplace/i/Salesforce.b2c-vs-extension?label=installs&color=0066d4">
+  </a>
+  <a href="https://open-vsx.org/extension/Salesforce/b2c-vs-extension">
+    <img alt="Open VSX version" src="https://img.shields.io/open-vsx/v/Salesforce/b2c-vs-extension?label=Open%20VSX&color=a60ee5">
+  </a>
+  <a href="license.txt">
+    <img alt="License: Apache-2.0" src="https://img.shields.io/badge/license-Apache%202.0-blue">
+  </a>
+</p>
+
+<p align="center">
+  <a href="https://marketplace.visualstudio.com/items?itemName=Salesforce.b2c-vs-extension"><strong>Install</strong></a>
+  ·
+  <a href="https://salesforcecommercecloud.github.io/b2c-developer-tooling/vscode-extension/"><strong>Documentation</strong></a>
+  ·
+  <a href="https://github.com/SalesforceCommerceCloud/b2c-developer-tooling"><strong>Source &amp; Issues</strong></a>
+  ·
+  <a href="CHANGELOG.md"><strong>Changelog</strong></a>
+</p>
+
+---
 
 ## Install
-
-- **VS Code Marketplace:** <https://marketplace.visualstudio.com/items?itemName=Salesforce.b2c-vs-extension>
-- **Open VSX:** <https://open-vsx.org/extension/Salesforce/b2c-vs-extension>
 
 From the command line:
 
 ```bash
 code --install-extension Salesforce.b2c-vs-extension
 ```
+
+Or in VS Code: **Extensions → search "B2C DX" → Install**.
+
+For VSCodium / Cursor / Eclipse Theia, install from [Open VSX](https://open-vsx.org/extension/Salesforce/b2c-vs-extension).
 
 ## Documentation
 
