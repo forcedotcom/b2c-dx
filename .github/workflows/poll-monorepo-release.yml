@@ -103,9 +103,23 @@ jobs:
             # wrong (0.10.10 < 0.10.9). Prereleases (e.g. 0.10.2-beta.1) are excluded:
             # the marketplace path only promotes stable releases, and a lower already
             # released version is caught by the idempotency guard below anyway.
-            VERSION=$(gh release list --repo "$EXPECTED_MONOREPO" --limit 100 --json tagName \
-              --jq '
-                [ .[] | .tagName
+            #
+            # Enumerate ALL releases via the paginated REST API, NOT a bounded
+            # `gh release list --limit N`. That list returns only the newest N *by
+            # publish date* (--order desc = createdAt), so on a busy monorepo the
+            # true semver-max could sit just past the page boundary and be silently
+            # dropped — reintroducing exactly the date-vs-semver trap noted above. By
+            # paginating the complete set, ordering and truncation stop mattering:
+            # we compute the max over every release. (REST uses tag_name, snake_case.)
+            #
+            # Fail closed: this runs under `set -euo pipefail`, so a `gh api` error
+            # aborts the assignment rather than yielding an empty (falsely "no
+            # releases") result. The two-stage pipe — page-stream of tag names, then
+            # numeric semver-max — is order-independent by construction.
+            VERSION=$(gh api "repos/${EXPECTED_MONOREPO}/releases?per_page=100" \
+                --paginate --jq '.[].tag_name' \
+              | jq -R -s -r '
+                [ split("\n")[]
                   | select(test("^b2c-vs-extension@[0-9]+\\.[0-9]+\\.[0-9]+$"))
                   | sub("^b2c-vs-extension@";"") ]
                 | if length == 0 then empty

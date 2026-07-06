@@ -191,6 +191,7 @@ jobs:
         if: always()
         env:
           IS_RELEASE: ${{ steps.classify.outputs.is_release }}
+          CLASSIFY_RESULT: ${{ steps.classify.outcome }}
           HEAD_SHA: ${{ steps.verify.outputs.head_sha }}
           VERSION: ${{ steps.verify.outputs.version }}
           RESULT: ${{ steps.verify.outcome }}
@@ -201,7 +202,17 @@ jobs:
           # current HEAD if the verify step was skipped or failed before emitting an output.
           SHA="${HEAD_SHA:-$(git rev-parse HEAD)}"
 
-          if [ "$IS_RELEASE" != "true" ]; then
+          # FAIL CLOSED on a classification failure. Classify decides whether this PR
+          # is gated at all; if it did not finish cleanly (e.g. set -euo pipefail
+          # tripped, or jq/`git show` errored), IS_RELEASE is empty. We must NOT then
+          # fall through to the "not a release -> neutral" branch below: a neutral
+          # conclusion is non-blocking, so a real release PR whose classifier crashed
+          # would silently open the gate. When we cannot prove a PR is safe, we fail it.
+          if [ "$CLASSIFY_RESULT" != "success" ]; then
+            CONCLUSION="failure"
+            TITLE="Could not classify PR — failing closed"
+            SUMMARY="The classification step did not complete successfully, so we cannot determine whether this is a release PR. Failing closed (do not merge). See the workflow logs."
+          elif [ "$IS_RELEASE" != "true" ]; then
             # Not a release PR — do not gate. NEUTRAL is non-blocking: it shows as a
             # grey "not applicable" tick, never a red failure, so general PRs pass.
             CONCLUSION="neutral"
