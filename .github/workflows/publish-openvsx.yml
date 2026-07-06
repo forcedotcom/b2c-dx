@@ -15,49 +15,121 @@ jobs:
     name: Publish VSIX to Open VSX Registry
     runs-on: ubuntu-latest
     environment: publish
+    permissions:
+      contents: read
     env:
       OVSX_PAT: ${{ secrets.IDEE_OVSX_PAT }}
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      # Trust identity for provenance verification. Hard-coded (NOT a repo variable)
+      # because this is the final marketplace gate: the identity a publish is
+      # verified against must be code-reviewed, not editable via mutable repo vars.
+      EXPECTED_MONOREPO: SalesforceCommerceCloud/b2c-developer-tooling
+      EXPECTED_SOURCE_REF: refs/heads/main
+      # Untrusted trigger inputs — bound to env, never interpolated into run: lines.
+      EVENT_NAME: ${{ github.event_name }}
+      RELEASE_TAG_NAME: ${{ github.event.release.tag_name }}
+      INPUT_TAG: ${{ github.event.inputs.tag }}
+      THIS_REPO: ${{ github.repository }}
     steps:
-      - uses: actions/setup-node@v4
+      # Checkout main to read the committed per-version release markers. Markers
+      # are added to main by reviewed release PRs and accumulate there.
+      - uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v4.3.0
+        with:
+          ref: main
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: ${{ vars.NODE_VERSION || 'lts/*' }}
 
       - name: Resolve release tag
         id: tag
         run: |
-          if [ "${{ github.event_name }}" = "release" ]; then
-            TAG="${{ github.event.release.tag_name }}"
-          elif [ -n "${{ inputs.tag }}" ]; then
-            TAG="${{ inputs.tag }}"
+          set -euo pipefail
+          if [ "$EVENT_NAME" = "release" ]; then
+            TAG="$RELEASE_TAG_NAME"
+          elif [ -n "$INPUT_TAG" ]; then
+            TAG="$INPUT_TAG"
           else
-            TAG=$(gh release list --repo "${{ github.repository }}" --limit 1 --json tagName --jq '.[0].tagName')
+            TAG=$(gh release list --repo "$THIS_REPO" --limit 1 --json tagName --jq '.[0].tagName')
           fi
           if [ -z "$TAG" ]; then
             echo "::error::Could not resolve a release tag to publish"
             exit 1
           fi
+          # Constrain the tag shape before it is used anywhere downstream.
+          if ! echo "$TAG" | grep -Eq '^b2c-vs-extension@[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$'; then
+            echo "::error::Refusing to publish unexpected tag '$TAG'"
+            exit 1
+          fi
           echo "Publishing tag: $TAG"
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=${TAG#b2c-vs-extension@}" >> "$GITHUB_OUTPUT"
 
       - name: Download VSIX from release
         id: download
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
         run: |
-          gh release download "${{ steps.tag.outputs.tag }}" \
-            --repo "${{ github.repository }}" \
+          set -euo pipefail
+          gh release download "$TAG" \
+            --repo "$THIS_REPO" \
             --pattern '*.vsix' \
-            --dir .
-          VSIX=$(ls *.vsix | head -n1)
-          if [ -z "$VSIX" ]; then
-            echo "::error::No .vsix asset found on release ${{ steps.tag.outputs.tag }}"
+            --dir /tmp/vsix
+          COUNT=$(ls /tmp/vsix/*.vsix 2>/dev/null | wc -l | tr -d ' ')
+          if [ "$COUNT" -ne 1 ]; then
+            echo "::error::Expected exactly one .vsix on release $TAG, found $COUNT"
             exit 1
           fi
+          VSIX=$(ls /tmp/vsix/*.vsix)
           echo "Downloaded VSIX: $VSIX"
           echo "vsix=$VSIX" >> "$GITHUB_OUTPUT"
 
-      - name: Publish to Open VSX Registry
+      # Final gate: verify SLSA build provenance before publishing. This closes the
+      # workflow_dispatch bypass — a manually triggered publish of an arbitrary tag
+      # (or any release not produced via the verified on-merge path) cannot reach the
+      # registry unless the VSIX is provably built by the monorepo's publish.yml
+      # ON MAIN (--source-ref pins the ref, not just the workflow path).
+      - name: Verify build provenance (SLSA attestation) — fail closed
+        env:
+          VSIX: ${{ steps.download.outputs.vsix }}
         run: |
+          set -euo pipefail
+          gh attestation verify "$VSIX" \
+            --repo "$EXPECTED_MONOREPO" \
+            --signer-workflow "${EXPECTED_MONOREPO}/.github/workflows/publish.yml" \
+            --source-ref "$EXPECTED_SOURCE_REF"
+
+      # Defense in depth: the VSIX must also match the sha256 recorded in the
+      # committed, PR-reviewed releases/<version>.json marker. This binds the
+      # published artifact to a human-reviewed release and blocks version
+      # rollback/substitution (e.g. attaching an old attested VSIX to a new tag).
+      - name: Cross-check VSIX against committed release marker — fail closed
+        env:
+          VSIX: ${{ steps.download.outputs.vsix }}
+          VERSION: ${{ steps.tag.outputs.version }}
+        run: |
+          set -euo pipefail
+          MARKER="releases/${VERSION}.json"
+          if [ ! -f "$MARKER" ]; then
+            echo "::error::No committed marker $MARKER on main; refusing to publish a release with no reviewed marker"
+            exit 1
+          fi
+          EXPECTED_SHA=$(jq -r '.vsixSha256 // empty' "$MARKER")
+          echo "$EXPECTED_SHA" | grep -Eq '^[a-f0-9]{64}$' \
+            || { echo "::error::marker $MARKER vsixSha256 missing/malformed"; exit 1; }
+          ACTUAL_SHA=$(sha256sum "$VSIX" | awk '{print $1}')
+          if [ "$ACTUAL_SHA" != "$EXPECTED_SHA" ]; then
+            echo "::error::VSIX sha256 does not match $MARKER. expected=$EXPECTED_SHA actual=$ACTUAL_SHA"
+            exit 1
+          fi
+          echo "::notice::VSIX matches committed marker $MARKER"
+
+      - name: Publish to Open VSX Registry
+        env:
+          VSIX: ${{ steps.download.outputs.vsix }}
+        run: |
+          set -euo pipefail
           npx --yes ovsx publish \
             --skip-duplicate \
             -p "$OVSX_PAT" \
-            "${{ steps.download.outputs.vsix }}"
+            "$VSIX"

@@ -7,22 +7,34 @@ on:
       - 'releases/latest.json'
   workflow_dispatch:
 
+permissions:
+  contents: read
+
+concurrency:
+  group: release-on-merge
+  cancel-in-progress: false
+
 jobs:
   release:
     name: Create GitHub release from merged release PR
     runs-on: ubuntu-latest
     permissions:
-      contents: write
+      contents: write # create the release + tag
+      actions: write # trigger publish-vscode / publish-openvsx via workflow_dispatch
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      # Allowlisted source repo. Override via repo variable for sandbox testing.
+      EXPECTED_MONOREPO: ${{ vars.EXPECTED_MONOREPO || 'SalesforceCommerceCloud/b2c-developer-tooling' }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v4.3.0
         with:
           fetch-depth: 2
 
       - name: Read release marker
         id: marker
         run: |
+          set -euo pipefail
+
           if [ ! -f releases/latest.json ]; then
             echo "::error::releases/latest.json is missing"
             exit 1
@@ -31,6 +43,7 @@ jobs:
           VERSION=$(jq -r '.version // empty' releases/latest.json)
           MONOREPO_TAG=$(jq -r '.monorepoTag // empty' releases/latest.json)
           MONOREPO_REPO=$(jq -r '.monorepoRepo // empty' releases/latest.json)
+          VSIX_SHA256=$(jq -r '.vsixSha256 // empty' releases/latest.json)
 
           if [ -z "$VERSION" ] || [ -z "$MONOREPO_TAG" ] || [ -z "$MONOREPO_REPO" ]; then
             echo "::notice::releases/latest.json has null version/tag/repo (sentinel state); nothing to release"
@@ -38,7 +51,18 @@ jobs:
             exit 0
           fi
 
-          # Skip if version is unchanged from the previous commit (e.g. only metadata edits)
+          # Allowlist the source repo (defense in depth; the marker is written by
+          # the receiver, but re-check at the gate that actually creates the release).
+          if [ "$MONOREPO_REPO" != "$EXPECTED_MONOREPO" ]; then
+            echo "::error::marker monorepoRepo '$MONOREPO_REPO' is not the allowlisted '$EXPECTED_MONOREPO'"
+            exit 1
+          fi
+
+          # Integrity anchor must be present and well-formed.
+          echo "$VSIX_SHA256" | grep -Eq '^[a-f0-9]{64}$' \
+            || { echo "::error::marker vsixSha256 is missing or malformed"; exit 1; }
+
+          # Skip if version is unchanged from the previous commit (e.g. metadata-only edits).
           PREV=$(git show HEAD~1:releases/latest.json 2>/dev/null | jq -r '.version // empty' || true)
           if [ "$PREV" = "$VERSION" ]; then
             echo "::notice::Version unchanged ($VERSION); nothing to release"
@@ -48,67 +72,120 @@ jobs:
 
           RELEASE_TAG="b2c-vs-extension@${VERSION}"
 
-          # Idempotency: skip if the release already exists in this repo
+          # Idempotency: skip if the release already exists in this repo.
           if gh release view "$RELEASE_TAG" --repo "${{ github.repository }}" >/dev/null 2>&1; then
             echo "::notice::Release $RELEASE_TAG already exists; skipping"
             echo "skip=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "release_tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
-          echo "monorepo_tag=$MONOREPO_TAG" >> "$GITHUB_OUTPUT"
-          echo "monorepo_repo=$MONOREPO_REPO" >> "$GITHUB_OUTPUT"
-          echo "skip=false" >> "$GITHUB_OUTPUT"
+          {
+            echo "version=$VERSION"
+            echo "release_tag=$RELEASE_TAG"
+            echo "monorepo_tag=$MONOREPO_TAG"
+            echo "monorepo_repo=$MONOREPO_REPO"
+            echo "vsix_sha256=$VSIX_SHA256"
+            echo "skip=false"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Download VSIX from monorepo release
         if: steps.marker.outputs.skip != 'true'
+        env:
+          MONOREPO_TAG: ${{ steps.marker.outputs.monorepo_tag }}
+          MONOREPO_REPO: ${{ steps.marker.outputs.monorepo_repo }}
         run: |
-          gh release download "${{ steps.marker.outputs.monorepo_tag }}" \
-            --repo "${{ steps.marker.outputs.monorepo_repo }}" \
+          set -euo pipefail
+          gh release download "$MONOREPO_TAG" \
+            --repo "$MONOREPO_REPO" \
             --pattern '*.vsix' \
             --dir .
           VSIX=$(ls *.vsix 2>/dev/null | head -n1)
           if [ -z "$VSIX" ]; then
-            echo "::error::No .vsix asset found on ${{ steps.marker.outputs.monorepo_repo }}@${{ steps.marker.outputs.monorepo_tag }}"
+            echo "::error::No .vsix asset found on ${MONOREPO_REPO}@${MONOREPO_TAG}"
             exit 1
           fi
           echo "Downloaded $VSIX"
           echo "VSIX=$VSIX" >> "$GITHUB_ENV"
 
+      - name: Verify VSIX integrity (sha256) — fail closed
+        if: steps.marker.outputs.skip != 'true'
+        env:
+          EXPECTED_SHA: ${{ steps.marker.outputs.vsix_sha256 }}
+        run: |
+          set -euo pipefail
+          ACTUAL_SHA=$(sha256sum "$VSIX" | awk '{print $1}')
+          if [ "$ACTUAL_SHA" != "$EXPECTED_SHA" ]; then
+            echo "::error::VSIX sha256 mismatch. expected=$EXPECTED_SHA actual=$ACTUAL_SHA"
+            exit 1
+          fi
+          echo "::notice::VSIX sha256 verified: $ACTUAL_SHA"
+
+      - name: Verify build provenance (SLSA attestation) — trust anchor, fail closed
+        if: steps.marker.outputs.skip != 'true'
+        env:
+          MONOREPO_REPO: ${{ steps.marker.outputs.monorepo_repo }}
+        run: |
+          set -euo pipefail
+          # This is the machine check that compensates for the human PR review
+          # (which only sees metadata). A tampered or foreign VSIX cannot reach
+          # release creation — and therefore cannot reach the marketplaces.
+          # --source-ref pins the git ref so only artifacts built+attested from
+          # the monorepo's main branch pass (see receive-monorepo-release.yml).
+          gh attestation verify "$VSIX" \
+            --repo "$MONOREPO_REPO" \
+            --signer-workflow "${MONOREPO_REPO}/.github/workflows/publish.yml" \
+            --source-ref refs/heads/main
+
       - name: Extract changelog section for release notes
         if: steps.marker.outputs.skip != 'true'
+        env:
+          VERSION: ${{ steps.marker.outputs.version }}
+          MONOREPO_REPO: ${{ steps.marker.outputs.monorepo_repo }}
+          MONOREPO_TAG: ${{ steps.marker.outputs.monorepo_tag }}
         run: |
+          set -euo pipefail
           awk '
             /^## / { if (found) exit; found=1; next }
             found { print }
           ' CHANGELOG.md > /tmp/release-notes.md
           {
-            cat <<HEADER
-          ## B2C DX VS Code Extension v${{ steps.marker.outputs.version }}
-
-          Source release: [${{ steps.marker.outputs.monorepo_repo }}@${{ steps.marker.outputs.monorepo_tag }}](https://github.com/${{ steps.marker.outputs.monorepo_repo }}/releases/tag/${{ steps.marker.outputs.monorepo_tag }})
-
-          Install via:
-          \`\`\`
-          code --install-extension b2c-vs-extension-${{ steps.marker.outputs.version }}.vsix
-          \`\`\`
-
-          Or in VS Code: Extensions → ⋯ → Install from VSIX...
-
-          ---
-
-          ### Changelog
-
-          HEADER
+            printf '## B2C DX VS Code Extension v%s\n\n' "$VERSION"
+            printf 'Source release: [%s@%s](https://github.com/%s/releases/tag/%s)\n\n' \
+              "$MONOREPO_REPO" "$MONOREPO_TAG" "$MONOREPO_REPO" "$MONOREPO_TAG"
+            printf 'Install via:\n```\ncode --install-extension b2c-vs-extension-%s.vsix\n```\n\n' "$VERSION"
+            printf 'Or in VS Code: Extensions → ⋯ → Install from VSIX...\n\n---\n\n### Changelog\n\n'
             cat /tmp/release-notes.md
           } > /tmp/full-release-notes.md
 
-      - name: Create release (fires publish workflows)
+      - name: Create release
         if: steps.marker.outputs.skip != 'true'
+        env:
+          RELEASE_TAG: ${{ steps.marker.outputs.release_tag }}
+          VERSION: ${{ steps.marker.outputs.version }}
         run: |
-          gh release create "${{ steps.marker.outputs.release_tag }}" \
+          set -euo pipefail
+          gh release create "$RELEASE_TAG" \
             --repo "${{ github.repository }}" \
-            --title "VS Code Extension ${{ steps.marker.outputs.version }}" \
+            --title "VS Code Extension ${VERSION}" \
             --notes-file /tmp/full-release-notes.md \
             "$VSIX"
+
+      # A `release` event created with GITHUB_TOKEN does NOT trigger other workflows
+      # (GitHub's recursion guard). workflow_dispatch is one of the two exceptions,
+      # so explicitly dispatch the publishers and pass the tag. Each publisher
+      # re-verifies the VSIX provenance before it touches a marketplace.
+      - name: Trigger marketplace publish workflows
+        if: steps.marker.outputs.skip != 'true'
+        env:
+          RELEASE_TAG: ${{ steps.marker.outputs.release_tag }}
+        run: |
+          set -euo pipefail
+          gh workflow run publish-vscode.yml \
+            --repo "${{ github.repository }}" \
+            --ref main \
+            -f tag="$RELEASE_TAG"
+          gh workflow run publish-openvsx.yml \
+            --repo "${{ github.repository }}" \
+            --ref main \
+            -f tag="$RELEASE_TAG"
+          echo "::notice::Dispatched publish-vscode and publish-openvsx for $RELEASE_TAG"
