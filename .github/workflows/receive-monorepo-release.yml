@@ -32,6 +32,8 @@ jobs:
     permissions:
       contents: write # push the release branch and write releases/*.json + CHANGELOG
       pull-requests: write # open the release PR
+      checks: write # post the release-provenance check-run onto the PR head commit
+      actions: write # dispatch validate-release-pr.yml (recursion-guard workaround)
     env:
       # Allowlisted source repo. Override via repo variable for sandbox testing.
       EXPECTED_MONOREPO: ${{ vars.EXPECTED_MONOREPO || 'SalesforceCommerceCloud/b2c-developer-tooling' }}
@@ -254,10 +256,15 @@ jobs:
             printf '2. Creates the `%s` release in this repo with the VSIX attached.\n' "$RELEASE_TAG"
             printf '3. Triggers `publish-vscode` and `publish-openvsx` (gated by the `publish` environment), which verify provenance once more, then publish.\n\n'
 
+            printf '### Automated checks on this PR\n\n'
+            printf -- '- `release-provenance` — the receiver verified the VSIX SHA-256 + SLSA provenance before opening this PR.\n'
+            printf -- '- `validate-release-pr` — an independent workflow re-downloads the VSIX and re-verifies SHA-256 + provenance from scratch against the committed marker.\n\n'
+            printf 'Both must be green before merge (enforce via branch protection). Merging is blocked until they pass.\n\n'
+
             printf '### Review checklist\n\n'
             printf -- '- [ ] Version `%s` is the intended release\n' "$VERSION"
             printf -- '- [ ] Changelog reads correctly\n'
-            printf -- '- [ ] Pre-merge checks have passed\n\n'
+            printf -- '- [ ] `release-provenance` and `validate-release-pr` checks are green\n\n'
 
             printf -- '---\n'
             printf '_Opened automatically by `receive-monorepo-release` after verifying the artifact. The VSIX SHA-256 and SLSA build provenance were checked before this PR was opened._\n'
@@ -279,3 +286,46 @@ jobs:
           # in the repo. Non-fatal: a missing label must not fail the release.
           gh pr edit "$BRANCH" --repo "${{ github.repository }}" --add-label release 2>/dev/null \
             || echo "::notice::'release' label not present in repo; skipping label"
+
+      - name: Post provenance check-run and dispatch independent validation
+        if: steps.validate.outputs.skip != 'true'
+        env:
+          VERSION: ${{ steps.validate.outputs.version }}
+          BRANCH: ${{ steps.validate.outputs.branch }}
+          VSIX_SHA256: ${{ steps.validate.outputs.vsix_sha256 }}
+          THIS_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          # Head commit of the release branch = the PR head. Checks attach to this SHA.
+          HEAD_SHA=$(git rev-parse HEAD)
+
+          # (A) Audit check-run: record that the receiver verified the artifact BEFORE
+          # opening the PR. Created via the API (not an event), so the GITHUB_TOKEN
+          # recursion guard does not suppress it — it shows in the PR's checks list.
+          jq -n \
+            --arg sha "$HEAD_SHA" \
+            --arg v "$VERSION" \
+            --arg digest "$VSIX_SHA256" \
+            '{
+              name: "release-provenance",
+              head_sha: $sha,
+              status: "completed",
+              conclusion: "success",
+              output: {
+                title: ("Provenance verified for " + $v),
+                summary: ("VSIX SHA-256 `" + $digest + "` and SLSA build provenance were verified against the allowlisted monorepo before this PR was opened.")
+              }
+            }' \
+          | gh api "repos/${THIS_REPO}/check-runs" --method POST --input -
+
+          # (B) Kick the INDEPENDENT validator. workflow_dispatch is exempt from the
+          # recursion guard (the pull_request event is suppressed for a PR opened with
+          # GITHUB_TOKEN), so this is what makes an on-PR gating check actually run.
+          # The validator re-reads the committed marker and re-verifies from scratch.
+          gh workflow run validate-release-pr.yml \
+            --repo "${THIS_REPO}" \
+            --ref "$BRANCH" \
+            -f release_branch="$BRANCH" \
+            -f version="$VERSION" \
+            || echo "::warning::Could not dispatch validate-release-pr.yml (ensure it exists on the default branch)"
