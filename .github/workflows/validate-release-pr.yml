@@ -58,6 +58,10 @@ jobs:
       IN_VERSION: ${{ github.event.inputs.version }}
       PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
       PR_HEAD_REF: ${{ github.event.pull_request.head.ref }}
+      # The PR's base branch (usually main). Used to tell a release PR apart from
+      # a general PR: a release PR sets releases/latest.json.version to a new,
+      # non-null semver relative to base; a general PR leaves it null/unchanged.
+      PR_BASE_REF: ${{ github.event.pull_request.base.ref }}
     steps:
       - name: Resolve ref to validate
         id: ref
@@ -75,9 +79,55 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           ref: ${{ steps.ref.outputs.checkout }}
+          # Need history so a pull_request run can read releases/latest.json on the
+          # base branch and compare it to the head (release-PR detection below).
+          fetch-depth: 0
+
+      # Classify the PR before doing any verification work. This workflow's
+      # pull_request trigger fires on ANY PR that touches releases/** or
+      # CHANGELOG.md — but only a RELEASE PR should be gated. A release PR is the
+      # one where releases/latest.json.version becomes a new, non-null semver
+      # relative to the base branch (this is exactly the signal the receiver sets,
+      # and the same one release-on-merge.yml keys off). A general PR (docs, CI,
+      # or one that only edits the sentinel while version stays null/unchanged) is
+      # NOT a release PR: we skip verification and post a NEUTRAL (non-blocking)
+      # check so the PR is never wrongly marked red. workflow_dispatch always
+      # means an explicit release validation, so it is never classified as a skip.
+      - name: Classify PR (release vs general)
+        id: classify
+        run: |
+          set -euo pipefail
+
+          if [ "$EVENT_NAME" != "pull_request" ]; then
+            echo "::notice::workflow_dispatch — treating as an explicit release validation."
+            echo "is_release=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          HEAD_VERSION=$(jq -r '.version // empty' releases/latest.json 2>/dev/null || true)
+
+          # Read the base branch's pointer for comparison. If releases/latest.json
+          # does not exist on base yet, treat base version as empty.
+          BASE_VERSION=$(git show "origin/${PR_BASE_REF}:releases/latest.json" 2>/dev/null \
+            | jq -r '.version // empty' 2>/dev/null || true)
+
+          if [ -z "$HEAD_VERSION" ]; then
+            echo "::notice::releases/latest.json.version is null/absent on this PR (sentinel state) — not a release PR. Skipping."
+            echo "is_release=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [ "$HEAD_VERSION" = "$BASE_VERSION" ]; then
+            echo "::notice::releases/latest.json.version ('$HEAD_VERSION') is unchanged from base — not a release PR. Skipping."
+            echo "is_release=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "::notice::Release PR detected: latest.json.version '$BASE_VERSION' -> '$HEAD_VERSION'."
+          echo "is_release=true" >> "$GITHUB_OUTPUT"
 
       - name: Re-verify marker, artifact, and provenance
         id: verify
+        if: steps.classify.outputs.is_release == 'true'
         run: |
           set -euo pipefail
           fail() { echo "::error::$1"; exit 1; }
@@ -140,6 +190,7 @@ jobs:
       - name: Post validate-release-pr check-run
         if: always()
         env:
+          IS_RELEASE: ${{ steps.classify.outputs.is_release }}
           HEAD_SHA: ${{ steps.verify.outputs.head_sha }}
           VERSION: ${{ steps.verify.outputs.version }}
           RESULT: ${{ steps.verify.outcome }}
@@ -147,9 +198,16 @@ jobs:
           set -euo pipefail
           # The check-run attaches to the PR head commit so it surfaces on the PR and
           # can be made a required status via branch protection. Falls back to the
-          # current HEAD if the verify step failed before emitting an output.
+          # current HEAD if the verify step was skipped or failed before emitting an output.
           SHA="${HEAD_SHA:-$(git rev-parse HEAD)}"
-          if [ "$RESULT" = "success" ]; then
+
+          if [ "$IS_RELEASE" != "true" ]; then
+            # Not a release PR — do not gate. NEUTRAL is non-blocking: it shows as a
+            # grey "not applicable" tick, never a red failure, so general PRs pass.
+            CONCLUSION="neutral"
+            TITLE="Not a release PR — skipped"
+            SUMMARY="This PR does not set releases/latest.json.version to a new release version, so no VSIX verification is required. (This check only gates release PRs opened by receive-monorepo-release.)"
+          elif [ "$RESULT" = "success" ]; then
             CONCLUSION="success"
             TITLE="Independent re-verification passed"
             SUMMARY="Re-read the committed marker, re-downloaded the VSIX from the allowlisted monorepo, and re-verified SHA-256 + SLSA build provenance for v${VERSION}."
