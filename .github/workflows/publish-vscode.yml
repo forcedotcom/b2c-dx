@@ -9,6 +9,23 @@ on:
         description: 'Release tag to publish (e.g. b2c-vs-extension@0.8.2). Leave empty to use the latest release.'
         required: false
         type: string
+      dry-run:
+        description: 'Verify (provenance + marker) but do NOT publish to the marketplace.'
+        required: false
+        default: false
+        type: boolean
+      slack-notification-title:
+        description: 'Title for the Slack success notification.'
+        required: false
+        default: '🎉 Extensions Released Successfully!'
+        type: string
+
+# Serialize publishes of the SAME tag; never cancel an in-flight upload. The prefix
+# is distinct per publisher (vscode/openvsx run in parallel) and distinct from
+# release-on-merge, so this only queues a duplicate publish of the same tag.
+concurrency:
+  group: publish-vscode-${{ github.event.release.tag_name || github.event.inputs.tag || github.ref }}
+  cancel-in-progress: false
 
 jobs:
   publish:
@@ -17,8 +34,10 @@ jobs:
     environment: publish
     permissions:
       contents: read
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+      version: ${{ steps.tag.outputs.version }}
     env:
-      VSCE_PAT: ${{ secrets.VSCE_PERSONAL_ACCESS_TOKEN }}
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       # Trust identity for provenance verification. Hard-coded (NOT a repo variable)
       # because this is the final marketplace gate: the identity a publish is
@@ -124,12 +143,125 @@ jobs:
           fi
           echo "::notice::VSIX matches committed marker $MARKER"
 
+      # Publish via the IDEE-maintained composite action (the same publish primitive
+      # salesforcecli/github-workflows' own vscode workflows call). It runs vsce
+      # publish --skip-duplicate on the file we hand it, plus audit logging + token
+      # masking. It is placed AFTER the SLSA + marker gates above, so we publish
+      # exactly the bytes we verified — the action does not re-fetch or rebuild.
+      # SHA-pinned (SFSS-243); the action is all inline bash (no transitive uses:),
+      # so the pin fully freezes it. dry-run threads the workflow_dispatch input;
+      # the release trigger carries no input, so it defaults to a real publish.
       - name: Publish to VS Code Marketplace
+        uses: salesforcecli/github-workflows/.github/actions/vscode/publish-vsix@029fab157f4fa95497bff43f70c2faaf3f0fcf41 # PR #158 merge
+        with:
+          vsix-path: ${{ steps.download.outputs.vsix }}
+          publish-tool: vsce
+          pre-release: 'false'
+          dry-run: ${{ github.event.inputs.dry-run || 'false' }}
         env:
-          VSIX: ${{ steps.download.outputs.vsix }}
-        run: |
-          set -euo pipefail
-          npx --yes @vscode/vsce publish \
-            --skip-duplicate \
-            --pat "$VSCE_PAT" \
-            --packagePath "$VSIX"
+          VSCE_PERSONAL_ACCESS_TOKEN: ${{ secrets.VSCE_PERSONAL_ACCESS_TOKEN }}
+
+  # ---------------------------------------------------------------------------
+  # Slack notifications — mirror the salesforcecli/github-workflows guideline
+  # (vscode-publish-extensions.yml): a success job and a failure job, both keyed
+  # off the publish job's result, using the shared IDEE_MAIN_SLACK_WEBHOOK and the
+  # slackapi/slack-github-action. Payload adapted to this single-extension,
+  # marker-driven pipeline (Repository / Tag / Version / Workflow-Run).
+  #
+  # Kept separate from `publish` (not inline) so a Slack outage can never fail an
+  # already-successful publish. Success is gated on a real (non-dry-run) publish;
+  # the failure job fires only when publish actually failed. The action is
+  # SHA-pinned (SFSS-243) to v3.0.3, the release the guideline uses.
+  #
+  # Prerequisite (outside code, provisioned per-repo like the guideline assumes):
+  # the IDEE_MAIN_SLACK_WEBHOOK secret. If it is unset, slack-github-action fails
+  # its own step, but because these jobs do NOT gate publish, an unset webhook
+  # cannot affect an already-completed publish.
+  # ---------------------------------------------------------------------------
+  slack-notify:
+    name: Notify Slack (success)
+    needs: publish
+    if: always() && needs.publish.result == 'success' && github.event.inputs.dry-run != 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Notify Slack
+        uses: slackapi/slack-github-action@45a88b9581bfab2566dc881e2cd66d334e621e2c # v3.0.3
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.IDEE_MAIN_SLACK_WEBHOOK }}
+        with:
+          payload: |
+            {
+              "text": "${{ github.event.inputs.slack-notification-title || '🎉 Extensions Released Successfully!' }}",
+              "blocks": [
+                {
+                  "type": "header",
+                  "text": {
+                    "type": "plain_text",
+                    "text": "${{ github.event.inputs.slack-notification-title || '🎉 Extensions Released Successfully!' }}"
+                  }
+                },
+                {
+                  "type": "section",
+                  "fields": [
+                    { "type": "mrkdwn", "text": "*Marketplace:*\nVS Code Marketplace" },
+                    { "type": "mrkdwn", "text": "*Repository:*\n${{ github.repository }}" },
+                    { "type": "mrkdwn", "text": "*Tag:*\n${{ needs.publish.outputs.tag }}" },
+                    { "type": "mrkdwn", "text": "*Version:*\n${{ needs.publish.outputs.version }}" }
+                  ]
+                },
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "*Workflow Run:* <${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View Details>"
+                  }
+                }
+              ]
+            }
+
+  slack-notify-failure:
+    name: Notify Slack (failure)
+    needs: publish
+    if: always() && needs.publish.result == 'failure'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Notify Slack
+        uses: slackapi/slack-github-action@45a88b9581bfab2566dc881e2cd66d334e621e2c # v3.0.3
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.IDEE_MAIN_SLACK_WEBHOOK }}
+        with:
+          payload: |
+            {
+              "text": "❌ VS Code Marketplace publish failed",
+              "blocks": [
+                {
+                  "type": "header",
+                  "text": {
+                    "type": "plain_text",
+                    "text": "❌ VS Code Marketplace publish failed"
+                  }
+                },
+                {
+                  "type": "section",
+                  "fields": [
+                    { "type": "mrkdwn", "text": "*Marketplace:*\nVS Code Marketplace" },
+                    { "type": "mrkdwn", "text": "*Repository:*\n${{ github.repository }}" },
+                    { "type": "mrkdwn", "text": "*Tag:*\n${{ needs.publish.outputs.tag }}" },
+                    { "type": "mrkdwn", "text": "*Version:*\n${{ needs.publish.outputs.version }}" }
+                  ]
+                },
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "*Workflow Run:* <${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View Details>"
+                  }
+                },
+                {
+                  "type": "context",
+                  "elements": [
+                    { "type": "mrkdwn", "text": "Check the workflow logs for detailed error information." }
+                  ]
+                }
+              ]
+            }
