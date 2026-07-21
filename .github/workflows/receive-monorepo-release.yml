@@ -1,0 +1,331 @@
+name: Receive monorepo VSIX release
+
+# Trust boundary: this workflow is triggered by a repository_dispatch fired from
+# the monorepo (SalesforceCommerceCloud/b2c-developer-tooling) after it builds,
+# attests, and releases a new VSIX. A repository_dispatch payload is NOT
+# authenticated — any token with dispatch scope on this repo can send one and
+# *claim* any monorepo_repo. Therefore the allowlist below is only a cheap sanity
+# filter; the real trust anchor is `gh attestation verify`, which cryptographically
+# proves the VSIX was built by the monorepo's publish.yml. We fail closed here so a
+# spoofed or tampered dispatch never even opens a PR.
+#
+# On success this opens a release PR (using this repo's own GITHUB_TOKEN — the
+# external credential never writes here). Merging that PR triggers
+# release-on-merge.yml, which re-verifies and creates the release that fires the
+# marketplace publish workflows.
+
+on:
+  repository_dispatch:
+    types: [monorepo-vsx-release]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: receive-monorepo-release-${{ github.event.client_payload.version }}
+  cancel-in-progress: false
+
+jobs:
+  open-release-pr:
+    name: Validate VSIX and open release PR
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # push the release branch and write releases/*.json + CHANGELOG
+      pull-requests: write # open the release PR
+      checks: write # post the release-provenance check-run onto the PR head commit
+      actions: write # dispatch validate-release-pr.yml (recursion-guard workaround)
+    env:
+      # Allowlisted source repo. Override via repo variable for sandbox testing.
+      EXPECTED_MONOREPO: ${{ vars.EXPECTED_MONOREPO || 'SalesforceCommerceCloud/b2c-developer-tooling' }}
+      # Raw, untrusted payload — validated before any use.
+      IN_VERSION: ${{ github.event.client_payload.version }}
+      IN_MONOREPO_REPO: ${{ github.event.client_payload.monorepo_repo }}
+      IN_MONOREPO_TAG: ${{ github.event.client_payload.monorepo_tag }}
+      IN_RELEASE_URL: ${{ github.event.client_payload.release_url }}
+      IN_VSIX_SHA256: ${{ github.event.client_payload.vsix_sha256 }}
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: Validate and allowlist payload
+        id: validate
+        run: |
+          set -euo pipefail
+
+          fail() { echo "::error::$1"; exit 1; }
+
+          # 1) Allowlist the claimed source repo (cheap sanity filter).
+          if [ "$IN_MONOREPO_REPO" != "$EXPECTED_MONOREPO" ]; then
+            fail "Dispatch source '$IN_MONOREPO_REPO' is not the allowlisted monorepo '$EXPECTED_MONOREPO'"
+          fi
+
+          # 2) Strict shape checks (fail closed on anything unexpected).
+          echo "$IN_VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$' \
+            || fail "version '$IN_VERSION' is not a valid semver"
+          echo "$IN_VSIX_SHA256" | grep -Eq '^[a-f0-9]{64}$' \
+            || fail "vsix_sha256 '$IN_VSIX_SHA256' is not a 64-char hex digest"
+          if [ "$IN_MONOREPO_TAG" != "b2c-vs-extension@${IN_VERSION}" ]; then
+            fail "monorepo_tag '$IN_MONOREPO_TAG' does not match expected 'b2c-vs-extension@${IN_VERSION}'"
+          fi
+
+          # Idempotency: nothing to do if this repo already released this version.
+          RELEASE_TAG="b2c-vs-extension@${IN_VERSION}"
+          if gh release view "$RELEASE_TAG" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            echo "::notice::Release $RELEASE_TAG already exists; skipping"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          {
+            echo "skip=false"
+            echo "version=$IN_VERSION"
+            echo "monorepo_repo=$IN_MONOREPO_REPO"
+            echo "monorepo_tag=$IN_MONOREPO_TAG"
+            echo "vsix_sha256=$IN_VSIX_SHA256"
+            echo "release_tag=$RELEASE_TAG"
+            echo "branch=release/b2c-vs-extension-${IN_VERSION}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Download VSIX from monorepo release
+        if: steps.validate.outputs.skip != 'true'
+        env:
+          MONOREPO_REPO: ${{ steps.validate.outputs.monorepo_repo }}
+          MONOREPO_TAG: ${{ steps.validate.outputs.monorepo_tag }}
+        run: |
+          set -euo pipefail
+          gh release download "$MONOREPO_TAG" \
+            --repo "$MONOREPO_REPO" \
+            --pattern '*.vsix' \
+            --dir /tmp/vsix
+          VSIX=$(ls /tmp/vsix/*.vsix 2>/dev/null | head -n1)
+          [ -n "$VSIX" ] || { echo "::error::No .vsix asset on ${MONOREPO_REPO}@${MONOREPO_TAG}"; exit 1; }
+          echo "VSIX=$VSIX" >> "$GITHUB_ENV"
+
+      - name: Verify VSIX integrity (sha256) — fail closed
+        if: steps.validate.outputs.skip != 'true'
+        env:
+          EXPECTED_SHA: ${{ steps.validate.outputs.vsix_sha256 }}
+        run: |
+          set -euo pipefail
+          ACTUAL_SHA=$(sha256sum "$VSIX" | awk '{print $1}')
+          if [ "$ACTUAL_SHA" != "$EXPECTED_SHA" ]; then
+            echo "::error::VSIX sha256 mismatch. expected=$EXPECTED_SHA actual=$ACTUAL_SHA"
+            exit 1
+          fi
+          echo "::notice::VSIX sha256 verified: $ACTUAL_SHA"
+
+      - name: Verify build provenance (SLSA attestation) — trust anchor, fail closed
+        if: steps.validate.outputs.skip != 'true'
+        env:
+          MONOREPO_REPO: ${{ steps.validate.outputs.monorepo_repo }}
+        run: |
+          set -euo pipefail
+          # Cryptographically proves the VSIX was produced by the monorepo's
+          # publish.yml workflow ON MAIN. This is what makes the unauthenticated
+          # dispatch safe: a forged event cannot forge this attestation.
+          # --signer-workflow pins the workflow path; --source-ref additionally
+          # pins the git ref, so a VSIX built+attested from any other branch
+          # (reachable via workflow_dispatch on an attacker branch) is rejected.
+          gh attestation verify "$VSIX" \
+            --repo "$MONOREPO_REPO" \
+            --signer-workflow "${MONOREPO_REPO}/.github/workflows/publish.yml" \
+            --source-ref refs/heads/main
+
+      - name: Checkout b2c-dx
+        if: steps.validate.outputs.skip != 'true'
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Assemble release PR contents
+        if: steps.validate.outputs.skip != 'true'
+        env:
+          VERSION: ${{ steps.validate.outputs.version }}
+          MONOREPO_REPO: ${{ steps.validate.outputs.monorepo_repo }}
+          MONOREPO_TAG: ${{ steps.validate.outputs.monorepo_tag }}
+          VSIX_SHA256: ${{ steps.validate.outputs.vsix_sha256 }}
+        run: |
+          set -euo pipefail
+
+          RELEASE_URL="https://github.com/${MONOREPO_REPO}/releases/tag/${MONOREPO_TAG}"
+
+          # Fetch the extension CHANGELOG.md from the monorepo AT THE TAG so this
+          # repo's CHANGELOG stays a faithful mirror. Safe: content is written to a
+          # file, never evaluated; the source was allowlisted + attestation-verified.
+          gh api "repos/${MONOREPO_REPO}/contents/packages/b2c-vs-extension/CHANGELOG.md?ref=${MONOREPO_TAG}" \
+            --jq '.content' | base64 -d > /tmp/monorepo-changelog.md
+
+          # Extract just the top (latest) section from the monorepo changelog.
+          NEW_SECTION_FILE=/tmp/vsx-changelog-section.md
+          {
+            echo "## ${VERSION}"
+            echo ""
+            awk '/^## / { if (found) exit; found=1; next } found { print }' /tmp/monorepo-changelog.md
+          } > "$NEW_SECTION_FILE"
+
+          # Idempotent splice into CHANGELOG.md right after the "# Change Log" header.
+          python3 - "$NEW_SECTION_FILE" "$VERSION" <<'PY'
+          import sys, re, pathlib
+          section_path, version = sys.argv[1], sys.argv[2]
+          new_section = pathlib.Path(section_path).read_text().rstrip() + "\n\n"
+          path = pathlib.Path("CHANGELOG.md")
+          text = path.read_text() if path.exists() else "# Change Log\n\n"
+          if not text.startswith("# Change Log"):
+              text = "# Change Log\n\n" + text
+          pattern = re.compile(rf"^## {re.escape(version)}\b.*?(?=^## |\Z)", re.M | re.S)
+          text = pattern.sub("", text, count=1)
+          text = re.sub(r"^(# Change Log\n+)", lambda m: m.group(1) + new_section, text, count=1)
+          path.write_text(text)
+          PY
+
+          # Immutable per-version marker + the mutable latest pointer. Both carry
+          # the VSIX sha256 so release-on-merge can re-verify integrity.
+          mkdir -p releases
+          write_marker() {
+            jq -n \
+              --arg version "$VERSION" \
+              --arg tag "$MONOREPO_TAG" \
+              --arg repo "$MONOREPO_REPO" \
+              --arg url "$RELEASE_URL" \
+              --arg sha "$VSIX_SHA256" \
+              '{
+                version: $version,
+                monorepoTag: $tag,
+                monorepoRepo: $repo,
+                monorepoReleaseUrl: $url,
+                vsixSha256: $sha
+              }' > "$1"
+          }
+          write_marker "releases/${VERSION}.json"
+          write_marker "releases/latest.json"
+
+      - name: Open release PR (using this repo's own token)
+        if: steps.validate.outputs.skip != 'true'
+        env:
+          VERSION: ${{ steps.validate.outputs.version }}
+          MONOREPO_REPO: ${{ steps.validate.outputs.monorepo_repo }}
+          MONOREPO_TAG: ${{ steps.validate.outputs.monorepo_tag }}
+          VSIX_SHA256: ${{ steps.validate.outputs.vsix_sha256 }}
+          BRANCH: ${{ steps.validate.outputs.branch }}
+        run: |
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git fetch origin "$BRANCH" 2>/dev/null && git checkout "$BRANCH" || git checkout -b "$BRANCH"
+          git add CHANGELOG.md "releases/${VERSION}.json" releases/latest.json
+
+          if git diff --cached --quiet; then
+            echo "::notice::No changes to commit on $BRANCH; PR may already be up to date"
+          else
+            git commit -m "Release b2c-vs-extension ${VERSION}"
+            git push --force-with-lease origin "$BRANCH"
+          fi
+
+          RELEASE_TAG="b2c-vs-extension@${VERSION}"
+          RELEASE_URL="https://github.com/${MONOREPO_REPO}/releases/tag/${MONOREPO_TAG}"
+
+          # Build the PR body with printf (format string is single-quoted, so the
+          # env values below cannot inject markup or shell). The changelog section
+          # was extracted from the verified source in the assemble step.
+          PR_BODY_FILE=/tmp/pr-body.md
+          {
+            printf '## Release `%s`\n\n' "$RELEASE_TAG"
+            printf 'Promotes **v%s** of the B2C DX VS Code extension for publishing to the VS Code Marketplace and Open VSX.\n\n' "$VERSION"
+
+            printf '### Release details\n\n'
+            printf '| | |\n|---|---|\n'
+            printf '| Version | `%s` |\n' "$VERSION"
+            printf '| Release tag (this repo) | `%s` |\n' "$RELEASE_TAG"
+            printf '| Source repo | `%s` |\n' "$MONOREPO_REPO"
+            printf '| Source release | [`%s`](%s) |\n' "$MONOREPO_TAG" "$RELEASE_URL"
+            printf '| VSIX SHA-256 | `%s` |\n' "$VSIX_SHA256"
+            printf '| Provenance | ✅ SLSA build provenance verified (built on `main`) |\n\n'
+
+            printf '### What'\''s changing\n\n'
+            # Drop the redundant leading "## <version>" heading and any leading
+            # blank lines so the changelog body nests cleanly under this section.
+            awk 'NR==1 && /^## / { next } !printed && /^[[:space:]]*$/ { next } { printed=1; print }' \
+              /tmp/vsx-changelog-section.md
+            printf '\n'
+
+            printf '### Files in this PR\n\n'
+            printf -- '- `CHANGELOG.md` — new `## %s` section (mirrors the source changelog)\n' "$VERSION"
+            printf -- '- `releases/%s.json` — immutable release marker (version, source tag, VSIX SHA-256)\n' "$VERSION"
+            printf -- '- `releases/latest.json` — pointer updated to this version\n\n'
+
+            printf '### What happens on merge\n\n'
+            printf '1. `release-on-merge` re-verifies the VSIX SHA-256 and SLSA build provenance.\n'
+            printf '2. Creates the `%s` release in this repo with the VSIX attached.\n' "$RELEASE_TAG"
+            printf '3. Triggers `publish-vscode` and `publish-openvsx` (gated by the `publish` environment), which verify provenance once more, then publish.\n\n'
+
+            printf '### Automated checks on this PR\n\n'
+            printf -- '- `release-provenance` — the receiver verified the VSIX SHA-256 + SLSA provenance before opening this PR.\n'
+            printf -- '- `validate-release-pr` — an independent workflow re-downloads the VSIX and re-verifies SHA-256 + provenance from scratch against the committed marker.\n\n'
+            printf 'Both must be green before merge (enforce via branch protection). Merging is blocked until they pass.\n\n'
+
+            printf '### Review checklist\n\n'
+            printf -- '- [ ] Version `%s` is the intended release\n' "$VERSION"
+            printf -- '- [ ] Changelog reads correctly\n'
+            printf -- '- [ ] `release-provenance` and `validate-release-pr` checks are green\n\n'
+
+            printf -- '---\n'
+            printf '_Opened automatically by `receive-monorepo-release` after verifying the artifact. The VSIX SHA-256 and SLSA build provenance were checked before this PR was opened._\n'
+          } > "$PR_BODY_FILE"
+
+          if gh pr view "$BRANCH" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            gh pr edit "$BRANCH" --repo "${{ github.repository }}" \
+              --title "Release b2c-vs-extension ${VERSION}" \
+              --body-file "$PR_BODY_FILE"
+          else
+            gh pr create --repo "${{ github.repository }}" \
+              --base main \
+              --head "$BRANCH" \
+              --title "Release b2c-vs-extension ${VERSION}" \
+              --body-file "$PR_BODY_FILE"
+          fi
+
+          # Tag the PR with a 'release' label for filtering, if the label exists
+          # in the repo. Non-fatal: a missing label must not fail the release.
+          gh pr edit "$BRANCH" --repo "${{ github.repository }}" --add-label release 2>/dev/null \
+            || echo "::notice::'release' label not present in repo; skipping label"
+
+      - name: Post provenance check-run and dispatch independent validation
+        if: steps.validate.outputs.skip != 'true'
+        env:
+          VERSION: ${{ steps.validate.outputs.version }}
+          BRANCH: ${{ steps.validate.outputs.branch }}
+          VSIX_SHA256: ${{ steps.validate.outputs.vsix_sha256 }}
+          THIS_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          # Head commit of the release branch = the PR head. Checks attach to this SHA.
+          HEAD_SHA=$(git rev-parse HEAD)
+
+          # (A) Audit check-run: record that the receiver verified the artifact BEFORE
+          # opening the PR. Created via the API (not an event), so the GITHUB_TOKEN
+          # recursion guard does not suppress it — it shows in the PR's checks list.
+          jq -n \
+            --arg sha "$HEAD_SHA" \
+            --arg v "$VERSION" \
+            --arg digest "$VSIX_SHA256" \
+            '{
+              name: "release-provenance",
+              head_sha: $sha,
+              status: "completed",
+              conclusion: "success",
+              output: {
+                title: ("Provenance verified for " + $v),
+                summary: ("VSIX SHA-256 `" + $digest + "` and SLSA build provenance were verified against the allowlisted monorepo before this PR was opened.")
+              }
+            }' \
+          | gh api "repos/${THIS_REPO}/check-runs" --method POST --input -
+
+          # (B) Kick the INDEPENDENT validator. workflow_dispatch is exempt from the
+          # recursion guard (the pull_request event is suppressed for a PR opened with
+          # GITHUB_TOKEN), so this is what makes an on-PR gating check actually run.
+          # The validator re-reads the committed marker and re-verifies from scratch.
+          gh workflow run validate-release-pr.yml \
+            --repo "${THIS_REPO}" \
+            --ref "$BRANCH" \
+            -f release_branch="$BRANCH" \
+            -f version="$VERSION" \
+            || echo "::warning::Could not dispatch validate-release-pr.yml (ensure it exists on the default branch)"

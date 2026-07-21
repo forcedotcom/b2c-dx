@@ -9,55 +9,259 @@ on:
         description: 'Release tag to publish (e.g. b2c-vs-extension@0.8.2). Leave empty to use the latest release.'
         required: false
         type: string
+      dry-run:
+        description: 'Verify (provenance + marker) but do NOT publish to the registry.'
+        required: false
+        default: false
+        type: boolean
+      slack-notification-title:
+        description: 'Title for the Slack success notification.'
+        required: false
+        default: '🎉 Extensions Released Successfully!'
+        type: string
+
+# Serialize publishes of the SAME tag; never cancel an in-flight upload. The prefix
+# is distinct per publisher (vscode/openvsx run in parallel) and distinct from
+# release-on-merge, so this only queues a duplicate publish of the same tag.
+concurrency:
+  group: publish-openvsx-${{ github.event.release.tag_name || github.event.inputs.tag || github.ref }}
+  cancel-in-progress: false
 
 jobs:
   publish:
     name: Publish VSIX to Open VSX Registry
     runs-on: ubuntu-latest
     environment: publish
+    permissions:
+      contents: read
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+      version: ${{ steps.tag.outputs.version }}
     env:
-      OVSX_PAT: ${{ secrets.IDEE_OVSX_PAT }}
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      # Trust identity for provenance verification. Hard-coded (NOT a repo variable)
+      # because this is the final marketplace gate: the identity a publish is
+      # verified against must be code-reviewed, not editable via mutable repo vars.
+      EXPECTED_MONOREPO: SalesforceCommerceCloud/b2c-developer-tooling
+      EXPECTED_SOURCE_REF: refs/heads/main
+      # Untrusted trigger inputs — bound to env, never interpolated into run: lines.
+      EVENT_NAME: ${{ github.event_name }}
+      RELEASE_TAG_NAME: ${{ github.event.release.tag_name }}
+      INPUT_TAG: ${{ github.event.inputs.tag }}
+      THIS_REPO: ${{ github.repository }}
     steps:
-      - uses: actions/setup-node@v4
+      # Checkout main to read the committed per-version release markers. Markers
+      # are added to main by reviewed release PRs and accumulate there.
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: main
+
+      - uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6.3.0
         with:
           node-version: ${{ vars.NODE_VERSION || 'lts/*' }}
 
       - name: Resolve release tag
         id: tag
         run: |
-          if [ "${{ github.event_name }}" = "release" ]; then
-            TAG="${{ github.event.release.tag_name }}"
-          elif [ -n "${{ inputs.tag }}" ]; then
-            TAG="${{ inputs.tag }}"
+          set -euo pipefail
+          if [ "$EVENT_NAME" = "release" ]; then
+            TAG="$RELEASE_TAG_NAME"
+          elif [ -n "$INPUT_TAG" ]; then
+            TAG="$INPUT_TAG"
           else
-            TAG=$(gh release list --repo "${{ github.repository }}" --limit 1 --json tagName --jq '.[0].tagName')
+            TAG=$(gh release list --repo "$THIS_REPO" --limit 1 --json tagName --jq '.[0].tagName')
           fi
           if [ -z "$TAG" ]; then
             echo "::error::Could not resolve a release tag to publish"
             exit 1
           fi
+          # Constrain the tag shape before it is used anywhere downstream.
+          if ! echo "$TAG" | grep -Eq '^b2c-vs-extension@[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$'; then
+            echo "::error::Refusing to publish unexpected tag '$TAG'"
+            exit 1
+          fi
           echo "Publishing tag: $TAG"
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=${TAG#b2c-vs-extension@}" >> "$GITHUB_OUTPUT"
 
       - name: Download VSIX from release
         id: download
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
         run: |
-          gh release download "${{ steps.tag.outputs.tag }}" \
-            --repo "${{ github.repository }}" \
+          set -euo pipefail
+          gh release download "$TAG" \
+            --repo "$THIS_REPO" \
             --pattern '*.vsix' \
-            --dir .
-          VSIX=$(ls *.vsix | head -n1)
-          if [ -z "$VSIX" ]; then
-            echo "::error::No .vsix asset found on release ${{ steps.tag.outputs.tag }}"
+            --dir /tmp/vsix
+          COUNT=$(ls /tmp/vsix/*.vsix 2>/dev/null | wc -l | tr -d ' ')
+          if [ "$COUNT" -ne 1 ]; then
+            echo "::error::Expected exactly one .vsix on release $TAG, found $COUNT"
             exit 1
           fi
+          VSIX=$(ls /tmp/vsix/*.vsix)
           echo "Downloaded VSIX: $VSIX"
           echo "vsix=$VSIX" >> "$GITHUB_OUTPUT"
 
-      - name: Publish to Open VSX Registry
+      # Final gate: verify SLSA build provenance before publishing. This closes the
+      # workflow_dispatch bypass — a manually triggered publish of an arbitrary tag
+      # (or any release not produced via the verified on-merge path) cannot reach the
+      # registry unless the VSIX is provably built by the monorepo's publish.yml
+      # ON MAIN (--source-ref pins the ref, not just the workflow path).
+      - name: Verify build provenance (SLSA attestation) — fail closed
+        env:
+          VSIX: ${{ steps.download.outputs.vsix }}
         run: |
-          npx --yes ovsx publish \
-            --skip-duplicate \
-            -p "$OVSX_PAT" \
-            "${{ steps.download.outputs.vsix }}"
+          set -euo pipefail
+          gh attestation verify "$VSIX" \
+            --repo "$EXPECTED_MONOREPO" \
+            --signer-workflow "${EXPECTED_MONOREPO}/.github/workflows/publish.yml" \
+            --source-ref "$EXPECTED_SOURCE_REF"
+
+      # Defense in depth: the VSIX must also match the sha256 recorded in the
+      # committed, PR-reviewed releases/<version>.json marker. This binds the
+      # published artifact to a human-reviewed release and blocks version
+      # rollback/substitution (e.g. attaching an old attested VSIX to a new tag).
+      - name: Cross-check VSIX against committed release marker — fail closed
+        env:
+          VSIX: ${{ steps.download.outputs.vsix }}
+          VERSION: ${{ steps.tag.outputs.version }}
+        run: |
+          set -euo pipefail
+          MARKER="releases/${VERSION}.json"
+          if [ ! -f "$MARKER" ]; then
+            echo "::error::No committed marker $MARKER on main; refusing to publish a release with no reviewed marker"
+            exit 1
+          fi
+          EXPECTED_SHA=$(jq -r '.vsixSha256 // empty' "$MARKER")
+          echo "$EXPECTED_SHA" | grep -Eq '^[a-f0-9]{64}$' \
+            || { echo "::error::marker $MARKER vsixSha256 missing/malformed"; exit 1; }
+          ACTUAL_SHA=$(sha256sum "$VSIX" | awk '{print $1}')
+          if [ "$ACTUAL_SHA" != "$EXPECTED_SHA" ]; then
+            echo "::error::VSIX sha256 does not match $MARKER. expected=$EXPECTED_SHA actual=$ACTUAL_SHA"
+            exit 1
+          fi
+          echo "::notice::VSIX matches committed marker $MARKER"
+
+      # Publish via the IDEE-maintained composite action (the same publish primitive
+      # salesforcecli/github-workflows' own vscode workflows call). It runs ovsx
+      # publish --skip-duplicate on the file we hand it, plus audit logging + token
+      # masking. It is placed AFTER the SLSA + marker gates above, so we publish
+      # exactly the bytes we verified — the action does not re-fetch or rebuild.
+      # SHA-pinned (SFSS-243); the action is all inline bash (no transitive uses:),
+      # so the pin fully freezes it. dry-run threads the workflow_dispatch input;
+      # the release trigger carries no input, so it defaults to a real publish.
+      - name: Publish to Open VSX Registry
+        uses: salesforcecli/github-workflows/.github/actions/vscode/publish-vsix@029fab157f4fa95497bff43f70c2faaf3f0fcf41 # PR #158 merge
+        with:
+          vsix-path: ${{ steps.download.outputs.vsix }}
+          publish-tool: ovsx
+          pre-release: 'false'
+          dry-run: ${{ github.event.inputs.dry-run || 'false' }}
+        env:
+          OVSX_PAT: ${{ secrets.IDEE_OVSX_PAT }}
+
+  # ---------------------------------------------------------------------------
+  # Slack notifications — mirror the salesforcecli/github-workflows guideline
+  # (vscode-publish-extensions.yml): a success job and a failure job, both keyed
+  # off the publish job's result, using the shared IDEE_MAIN_SLACK_WEBHOOK and the
+  # slackapi/slack-github-action. Payload adapted to this single-extension,
+  # marker-driven pipeline (Repository / Tag / Version / Workflow-Run).
+  #
+  # Kept separate from `publish` (not inline) so a Slack outage can never fail an
+  # already-successful publish. Success is gated on a real (non-dry-run) publish;
+  # the failure job fires only when publish actually failed. The action is
+  # SHA-pinned (SFSS-243) to v3.0.3, the release the guideline uses.
+  #
+  # Prerequisite (outside code, provisioned per-repo like the guideline assumes):
+  # the IDEE_MAIN_SLACK_WEBHOOK secret. If it is unset, slack-github-action fails
+  # its own step, but because these jobs do NOT gate publish, an unset webhook
+  # cannot affect an already-completed publish.
+  # ---------------------------------------------------------------------------
+  slack-notify:
+    name: Notify Slack (success)
+    needs: publish
+    if: always() && needs.publish.result == 'success' && github.event.inputs.dry-run != 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Notify Slack
+        uses: slackapi/slack-github-action@45a88b9581bfab2566dc881e2cd66d334e621e2c # v3.0.3
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.IDEE_MAIN_SLACK_WEBHOOK }}
+        with:
+          payload: |
+            {
+              "text": "${{ github.event.inputs.slack-notification-title || '🎉 Extensions Released Successfully!' }}",
+              "blocks": [
+                {
+                  "type": "header",
+                  "text": {
+                    "type": "plain_text",
+                    "text": "${{ github.event.inputs.slack-notification-title || '🎉 Extensions Released Successfully!' }}"
+                  }
+                },
+                {
+                  "type": "section",
+                  "fields": [
+                    { "type": "mrkdwn", "text": "*Registry:*\nOpen VSX Registry" },
+                    { "type": "mrkdwn", "text": "*Repository:*\n${{ github.repository }}" },
+                    { "type": "mrkdwn", "text": "*Tag:*\n${{ needs.publish.outputs.tag }}" },
+                    { "type": "mrkdwn", "text": "*Version:*\n${{ needs.publish.outputs.version }}" }
+                  ]
+                },
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "*Workflow Run:* <${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View Details>"
+                  }
+                }
+              ]
+            }
+
+  slack-notify-failure:
+    name: Notify Slack (failure)
+    needs: publish
+    if: always() && needs.publish.result == 'failure'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Notify Slack
+        uses: slackapi/slack-github-action@45a88b9581bfab2566dc881e2cd66d334e621e2c # v3.0.3
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.IDEE_MAIN_SLACK_WEBHOOK }}
+        with:
+          payload: |
+            {
+              "text": "❌ Open VSX Registry publish failed",
+              "blocks": [
+                {
+                  "type": "header",
+                  "text": {
+                    "type": "plain_text",
+                    "text": "❌ Open VSX Registry publish failed"
+                  }
+                },
+                {
+                  "type": "section",
+                  "fields": [
+                    { "type": "mrkdwn", "text": "*Registry:*\nOpen VSX Registry" },
+                    { "type": "mrkdwn", "text": "*Repository:*\n${{ github.repository }}" },
+                    { "type": "mrkdwn", "text": "*Tag:*\n${{ needs.publish.outputs.tag }}" },
+                    { "type": "mrkdwn", "text": "*Version:*\n${{ needs.publish.outputs.version }}" }
+                  ]
+                },
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "*Workflow Run:* <${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View Details>"
+                  }
+                },
+                {
+                  "type": "context",
+                  "elements": [
+                    { "type": "mrkdwn", "text": "Check the workflow logs for detailed error information." }
+                  ]
+                }
+              ]
+            }

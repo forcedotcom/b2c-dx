@@ -61,17 +61,20 @@ What lives here:
 
 - The marketplace landing page (this README), Apache-2.0 license, and governance files (CODE_OF_CONDUCT, CONTRIBUTING, SECURITY, CODEOWNERS).
 - A mirrored CHANGELOG.
-- A `releases/latest.json` marker file pointing at the most recently released monorepo tag.
-- The GitHub Actions workflows that turn each merged release PR into a published extension.
+- Per-version `releases/*.json` markers (and a `releases/latest.json` pointer) recording the monorepo tag and the VSIX's sha256.
+- The GitHub Actions workflows that turn each release into a published extension.
 
 What does **not** live here: the extension's source code, build tooling, tests, or developer docs. Those live in the monorepo.
 
+Nothing published from this repo is built here. The only artifact that crosses the boundary is the VSIX, which is built and cryptographically attested (SLSA build provenance) in the monorepo. Every workflow here re-verifies that provenance before acting, so a tampered or foreign VSIX cannot reach the marketplaces.
+
 ## How a release lands here
 
-1. The monorepo cuts a stable release of `b2c-vs-extension`, builds the VSIX, and attaches it to a GitHub release on the monorepo.
-2. The monorepo opens a **release PR** on this repo titled `Release b2c-vs-extension X.Y.Z`. The PR updates `CHANGELOG.md` and rewrites `releases/latest.json` with the version, monorepo tag, and source release URL.
+1. The monorepo cuts a stable release of `b2c-vs-extension`, builds the VSIX, attaches it to a GitHub release on the monorepo, and **attests its build provenance**.
+2. This repo detects the release itself — no credential or GitHub App is needed. `.github/workflows/poll-monorepo-release.yml` runs on a schedule (and on demand), reads the monorepo's public releases using only this repo's own `GITHUB_TOKEN`, and selects the highest stable `b2c-vs-extension` version. When it finds one not already handled, it wakes `.github/workflows/receive-monorepo-release.yml` (via an internal `repository_dispatch`), which downloads the VSIX, **verifies its sha256 and build provenance**, and opens a **release PR** titled `Release b2c-vs-extension X.Y.Z` that updates `CHANGELOG.md` and the `releases/*.json` markers.
 3. A maintainer reviews and merges the PR (this is the manual gate before anything reaches the marketplaces).
-4. On merge, `.github/workflows/release-on-merge.yml` reads the marker, downloads the VSIX from the monorepo release, and creates a release on this repo. The release event fires `publish-vscode.yml` and `publish-openvsx.yml`, which `vsce publish` and `ovsx publish` to the marketplaces.
+4. On merge, `.github/workflows/release-on-merge.yml` reads the marker, downloads the VSIX, **re-verifies sha256 + provenance**, and creates a release on this repo — then triggers `publish-vscode.yml` and `publish-openvsx.yml`.
+5. Each publish workflow runs in the protected `publish` environment (where the marketplace tokens live), **verifies provenance one final time**, and then `vsce publish` / `ovsx publish` to the VS Code Marketplace and Open VSX.
 
 ## Issues, bugs, feature requests
 
