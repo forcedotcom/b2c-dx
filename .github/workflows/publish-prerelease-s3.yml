@@ -1,0 +1,407 @@
+name: Publish nightly/beta pre-release VSIX (S3)
+
+# Consumer for the nightly + beta channels (W-23509605). Unlike rc/stable — which
+# arrive as GitHub releases with a committed, PR-reviewed marker — nightly and beta
+# are delivered ONLY to S3 by the monorepo's publish.yml (no git tag, no GitHub
+# release, no PR). The monorepo packages the odd-minor pre-release VSIX, sha256s it,
+# SLSA-attests the exact file, and uploads:
+#     s3://<bucket>/<prefix>/<channel>/<file>.vsix        (channel = nightly | beta)
+#     s3://<bucket>/<prefix>/<channel>/<file>.vsix.sha256 (sidecar = "<sha>  <file>")
+#
+# This workflow POLLS those prefixes (cron), re-verifies each artifact from scratch,
+# and publishes the pre-release VSIX to BOTH marketplaces. It is direct-publish (no
+# PR): the trust anchors are the same as the release path —
+#   1) sha256 recomputed and matched against the S3 sidecar (fail closed), and
+#   2) SLSA build provenance verified, pinned to the monorepo's publish.yml ON MAIN
+#      (--source-ref, fail closed). Beta builds on merge to `develop` but its
+#      provenance still records refs/heads/main — publish.yml runs in the default-
+#      branch context for both `schedule` and `workflow_run`, exactly as the stable
+#      VSIX (built from a release/** checkout) also attests refs/heads/main.
+# Idempotency is the marketplaces' own `--skip-duplicate` (native in publish-vsix);
+# nothing is written back to this repo. The audit trail is publish-vsix's audit log,
+# the Slack cards, the durable S3 objects, and this workflow's run history.
+#
+# TRUST BOUNDARY: S3 is a NEW surface for b2c-dx (the release path is credential-
+# free). We read it with a short-lived, READ-ONLY role assumed via OIDC — no long-
+# lived AWS credential is stored. The role ARN + bucket/prefix/region are provisioned
+# outside this code (see the env block). Reading S3 gets us untrusted bytes; the
+# sha256 + SLSA gates below are what make them trustworthy before an irreversible
+# marketplace publish.
+#
+# OPERATOR NOTE (environment): this reuses the existing `publish` environment so the
+# marketplace PATs + OIDC role live behind the same protected boundary as the
+# release publishers. For the cron path to run UNATTENDED (as decided for nightly),
+# `publish` must NOT require manual reviewers for this workflow; if it does, every
+# nightly run will pause for approval. That is a repo setting you control, not code.
+
+on:
+  schedule:
+    # Poll a couple of hours after the monorepo's nightly cron (02:00 UTC) so the
+    # night's VSIX is already in S3. Weekdays mirror the monorepo nightly cadence;
+    # a manual dispatch covers weekends/backfill.
+    - cron: '0 4 * * 1-5'
+  workflow_dispatch:
+    inputs:
+      channel:
+        description: 'Which channel(s) to publish from S3.'
+        required: false
+        default: both
+        type: choice
+        options:
+          - both
+          - nightly
+          - beta
+      window-days:
+        description: 'Only consider VSIX whose date-encoded version falls within the last N days. Defaults to the PRERELEASE_S3_WINDOW_DAYS variable, then 3.'
+        required: false
+        type: string
+      dry-run:
+        description: 'Verify (sha256 + SLSA) but do NOT publish to the marketplaces.'
+        required: false
+        default: false
+        type: boolean
+      slack-notification-title:
+        description: 'Title for the Slack success notification.'
+        required: false
+        default: '🌙 Pre-release (nightly/beta) published'
+        type: string
+
+# Serialize polls so two runs never race the same S3 objects, and never cancel an
+# in-flight publish. (--skip-duplicate already makes re-publish safe, but serializing
+# also keeps the ascending-version publish order below intact.)
+concurrency:
+  group: publish-prerelease-s3
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Verify and publish nightly/beta pre-release VSIX
+    runs-on: ubuntu-latest
+    environment: publish
+    permissions:
+      id-token: write # assume the read-only S3 role via OIDC (no stored AWS key)
+      contents: read
+    outputs:
+      published: ${{ steps.summary.outputs.published }}
+      summary: ${{ steps.summary.outputs.summary }}
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      # Trust identity for provenance verification. Hard-coded (NOT a repo variable)
+      # because this is the final marketplace gate: the identity a publish is verified
+      # against must be code-reviewed, not editable via mutable repo vars — identical
+      # to the release publishers.
+      EXPECTED_MONOREPO: SalesforceCommerceCloud/b2c-developer-tooling
+      EXPECTED_SOURCE_REF: refs/heads/main
+      # S3 delivery config (provisioned outside this code). The role is READ-ONLY and
+      # assumed via OIDC. Stored as a SECRET (not a variable) so it is masked in logs
+      # and the embedded AWS account ID is not disclosed — and to stay consistent with
+      # the write-side VSIX_S3_ROLE_ARN + VSIX_S3_BUCKET, which are also secrets. Its
+      # presence (with VSIX_S3_BUCKET) is still the on/off switch for the whole lane.
+      VSIX_S3_READ_ROLE_ARN: ${{ secrets.VSIX_S3_READ_ROLE_ARN }}
+      VSIX_S3_BUCKET: ${{ secrets.VSIX_S3_BUCKET }}
+      VSIX_S3_REGION: ${{ vars.VSIX_S3_REGION || 'us-east-1' }}
+      VSIX_S3_PREFIX: ${{ vars.VSIX_S3_PREFIX }}
+      # Untrusted trigger inputs — bound to env, validated before use, never inlined.
+      CHANNEL_FILTER: ${{ github.event.inputs.channel || 'both' }}
+      WINDOW_DAYS: ${{ github.event.inputs.window-days || vars.PRERELEASE_S3_WINDOW_DAYS || '3' }}
+    steps:
+      # Preflight: if S3 delivery is not configured, skip cleanly instead of failing
+      # every cron run (mirrors the monorepo's vsix-s3-cfg gate on the emission side).
+      - name: Preflight — is S3 delivery configured?
+        id: preflight
+        run: |
+          set -euo pipefail
+          if [ -z "$VSIX_S3_READ_ROLE_ARN" ] || [ -z "$VSIX_S3_BUCKET" ]; then
+            echo "::notice::S3 pre-release delivery not configured (VSIX_S3_READ_ROLE_ARN and/or VSIX_S3_BUCKET unset); nothing to poll."
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Configure AWS credentials (read-only, via OIDC)
+        if: steps.preflight.outputs.enabled == 'true'
+        uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a # v4
+        with:
+          # Single-sourced from the job-level env (bound to secrets.VSIX_S3_READ_ROLE_ARN).
+          role-to-assume: ${{ env.VSIX_S3_READ_ROLE_ARN }}
+          aws-region: ${{ vars.VSIX_S3_REGION || 'us-east-1' }}
+
+      - uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6.3.0
+        if: steps.preflight.outputs.enabled == 'true'
+        with:
+          node-version: ${{ vars.NODE_VERSION || 'lts/*' }}
+
+      # Discover the highest in-window VSIX per requested channel, download it plus
+      # its sha256 sidecar, and re-verify BOTH from scratch (sha256 vs sidecar, then
+      # SLSA provenance). Publishing only the highest per channel keeps the single
+      # monotonic Marketplace pre-release line clean; any older/intermediate in-window
+      # files are logged and remain available on npm + S3 (never silently dropped).
+      # A verification FAILURE fails the whole job — a tampered artifact must never be
+      # skipped past. A channel merely having nothing new is not a failure.
+      - name: Discover, download, and verify pre-release VSIX
+        id: resolve
+        if: steps.preflight.outputs.enabled == 'true'
+        run: |
+          set -euo pipefail
+          fail() { echo "::error::$1"; exit 1; }
+
+          echo "$WINDOW_DAYS" | grep -Eq '^[0-9]+$' \
+            || fail "window-days '$WINDOW_DAYS' must be a non-negative integer"
+          CUTOFF=$(date -u -d "${WINDOW_DAYS} days ago" +%Y%m%d)
+          echo "::notice::window: considering VSIX dated >= ${CUTOFF} (last ${WINDOW_DAYS} day(s))"
+
+          PREFIX="${VSIX_S3_PREFIX:+${VSIX_S3_PREFIX%/}/}"
+
+          process_channel() {
+            ch="$1" # nightly | beta
+            best_ver=""; best_file=""; best_patch=-1; skipped=0
+
+            while IFS= read -r line; do
+              f=$(printf '%s\n' "$line" | awk '{print $NF}')
+              case "$f" in *.vsix) : ;; *) continue ;; esac
+              # Extract the marketplace version and constrain the filename shape.
+              ver=$(printf '%s\n' "$f" | sed -nE 's/^b2c-vs-extension-([0-9]+\.[0-9]+\.[0-9]+)\.vsix$/\1/p')
+              [ -n "$ver" ] || { echo "::warning::${ch}: ignoring unrecognized object '$f'"; continue; }
+              # Pre-release channels are the ODD-minor track. A stable (even-minor)
+              # VSIX must never appear here; skip defensively if one somehow does.
+              minor=$(printf '%s\n' "$ver" | cut -d. -f2)
+              if [ $((minor % 2)) -ne 1 ]; then
+                echo "::warning::${ch}: ignoring '$f' — minor $minor is not odd (not a pre-release version)"
+                continue
+              fi
+              patch=$(printf '%s\n' "$ver" | cut -d. -f3)
+              fdate=${patch:0:8}
+              printf '%s\n' "$fdate" | grep -Eq '^[0-9]{8}$' \
+                || { echo "::warning::${ch}: ignoring '$f' — no date in patch"; continue; }
+              # Window filter (8-digit YYYYMMDD compares correctly as a string).
+              if [ "$fdate" \< "$CUTOFF" ]; then continue; fi
+              p=$((10#$patch))
+              if [ "$p" -gt "$best_patch" ]; then
+                [ "$best_patch" -ge 0 ] && skipped=$((skipped + 1))
+                best_patch=$p; best_ver="$ver"; best_file="$f"
+              else
+                skipped=$((skipped + 1))
+              fi
+            done < <(aws s3 ls "s3://${VSIX_S3_BUCKET}/${PREFIX}${ch}/" 2>/dev/null || true)
+
+            if [ -z "$best_file" ]; then
+              echo "::notice::${ch}: no new in-window VSIX found"
+              echo "${ch}_file=" >> "$GITHUB_OUTPUT"
+              return 0
+            fi
+            if [ "$skipped" -gt 0 ]; then
+              echo "::notice::${ch}: publishing highest in-window ($best_ver); $skipped older/intermediate in-window file(s) NOT published (still on npm + S3)"
+            fi
+
+            dir="/tmp/s3-${ch}"; rm -rf "$dir"; mkdir -p "$dir"
+            aws s3 cp "s3://${VSIX_S3_BUCKET}/${PREFIX}${ch}/${best_file}" "${dir}/${best_file}" >/dev/null \
+              || fail "${ch}: failed to download ${best_file}"
+            aws s3 cp "s3://${VSIX_S3_BUCKET}/${PREFIX}${ch}/${best_file}.sha256" "${dir}/${best_file}.sha256" >/dev/null \
+              || fail "${ch}: missing sha256 sidecar for ${best_file}"
+
+            # Sidecar format is "<sha>  <file>" (as written by the monorepo).
+            sha_expected=$(awk '{print $1}' "${dir}/${best_file}.sha256")
+            sha_named=$(awk '{print $2}' "${dir}/${best_file}.sha256")
+            echo "$sha_expected" | grep -Eq '^[a-f0-9]{64}$' \
+              || fail "${ch}: sidecar sha256 for ${best_file} is missing/malformed"
+            [ "$sha_named" = "$best_file" ] \
+              || fail "${ch}: sidecar names '$sha_named', expected '$best_file'"
+            sha_actual=$(sha256sum "${dir}/${best_file}" | awk '{print $1}')
+            [ "$sha_actual" = "$sha_expected" ] \
+              || fail "${ch}: sha256 mismatch for ${best_file}: sidecar=$sha_expected actual=$sha_actual"
+
+            # SLSA build provenance — pinned to the monorepo's publish.yml ON MAIN.
+            # Same incantation as the release path; fail closed.
+            gh attestation verify "${dir}/${best_file}" \
+              --repo "$EXPECTED_MONOREPO" \
+              --signer-workflow "${EXPECTED_MONOREPO}/.github/workflows/publish.yml" \
+              --source-ref "$EXPECTED_SOURCE_REF" \
+              || fail "${ch}: SLSA provenance verification failed for ${best_file}"
+
+            echo "::notice::${ch}: verified ${best_file} (${sha_actual})"
+            echo "${ch}_file=${dir}/${best_file}" >> "$GITHUB_OUTPUT"
+            echo "${ch}_version=${best_ver}" >> "$GITHUB_OUTPUT"
+          }
+
+          case "$CHANNEL_FILTER" in
+            both)
+              process_channel nightly
+              process_channel beta
+              ;;
+            nightly)
+              process_channel nightly
+              echo "beta_file=" >> "$GITHUB_OUTPUT"
+              ;;
+            beta)
+              echo "nightly_file=" >> "$GITHUB_OUTPUT"
+              process_channel beta
+              ;;
+            *)
+              fail "invalid channel '$CHANNEL_FILTER' (expected both|nightly|beta)"
+              ;;
+          esac
+
+      # Publish order matters for Marketplace monotonicity: within a single day the
+      # nightly patch (…00) is LOWER than any beta patch (…NN), so nightly is
+      # published BEFORE beta. Each channel goes to both marketplaces via the same
+      # SHA-pinned publish-vsix primitive the release path uses, AFTER the sha256 +
+      # SLSA gates above — so we publish exactly the bytes we verified. pre-release is
+      # always true here (both channels are the odd-minor pre-release track).
+
+      - name: Publish nightly to VS Code Marketplace
+        if: steps.preflight.outputs.enabled == 'true' && steps.resolve.outputs.nightly_file != ''
+        uses: salesforcecli/github-workflows/.github/actions/vscode/publish-vsix@029fab157f4fa95497bff43f70c2faaf3f0fcf41 # PR #158 merge
+        with:
+          vsix-path: ${{ steps.resolve.outputs.nightly_file }}
+          publish-tool: vsce
+          pre-release: 'true'
+          dry-run: ${{ github.event.inputs.dry-run || 'false' }}
+        env:
+          VSCE_PERSONAL_ACCESS_TOKEN: ${{ secrets.VSCE_PERSONAL_ACCESS_TOKEN }}
+
+      - name: Publish nightly to Open VSX Registry
+        if: steps.preflight.outputs.enabled == 'true' && steps.resolve.outputs.nightly_file != ''
+        uses: salesforcecli/github-workflows/.github/actions/vscode/publish-vsix@029fab157f4fa95497bff43f70c2faaf3f0fcf41 # PR #158 merge
+        with:
+          vsix-path: ${{ steps.resolve.outputs.nightly_file }}
+          publish-tool: ovsx
+          pre-release: 'true'
+          dry-run: ${{ github.event.inputs.dry-run || 'false' }}
+        env:
+          OVSX_PAT: ${{ secrets.IDEE_OVSX_PAT }}
+
+      - name: Publish beta to VS Code Marketplace
+        if: steps.preflight.outputs.enabled == 'true' && steps.resolve.outputs.beta_file != ''
+        uses: salesforcecli/github-workflows/.github/actions/vscode/publish-vsix@029fab157f4fa95497bff43f70c2faaf3f0fcf41 # PR #158 merge
+        with:
+          vsix-path: ${{ steps.resolve.outputs.beta_file }}
+          publish-tool: vsce
+          pre-release: 'true'
+          dry-run: ${{ github.event.inputs.dry-run || 'false' }}
+        env:
+          VSCE_PERSONAL_ACCESS_TOKEN: ${{ secrets.VSCE_PERSONAL_ACCESS_TOKEN }}
+
+      - name: Publish beta to Open VSX Registry
+        if: steps.preflight.outputs.enabled == 'true' && steps.resolve.outputs.beta_file != ''
+        uses: salesforcecli/github-workflows/.github/actions/vscode/publish-vsix@029fab157f4fa95497bff43f70c2faaf3f0fcf41 # PR #158 merge
+        with:
+          vsix-path: ${{ steps.resolve.outputs.beta_file }}
+          publish-tool: ovsx
+          pre-release: 'true'
+          dry-run: ${{ github.event.inputs.dry-run || 'false' }}
+        env:
+          OVSX_PAT: ${{ secrets.IDEE_OVSX_PAT }}
+
+      - name: Summarize what was published
+        id: summary
+        if: always() && steps.preflight.outputs.enabled == 'true'
+        env:
+          NIGHTLY_FILE: ${{ steps.resolve.outputs.nightly_file }}
+          NIGHTLY_VERSION: ${{ steps.resolve.outputs.nightly_version }}
+          BETA_FILE: ${{ steps.resolve.outputs.beta_file }}
+          BETA_VERSION: ${{ steps.resolve.outputs.beta_version }}
+        run: |
+          set -euo pipefail
+          PARTS=""
+          [ -n "$NIGHTLY_FILE" ] && PARTS="${PARTS}nightly ${NIGHTLY_VERSION}; "
+          [ -n "$BETA_FILE" ] && PARTS="${PARTS}beta ${BETA_VERSION}; "
+          if [ -n "$PARTS" ]; then
+            echo "published=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "published=false" >> "$GITHUB_OUTPUT"
+          fi
+          echo "summary=${PARTS:-nothing new in window}" >> "$GITHUB_OUTPUT"
+
+  # ---------------------------------------------------------------------------
+  # Slack notifications — same pattern as the release publishers: separate success
+  # and failure jobs keyed off the publish job's result, using the shared
+  # IDEE_MAIN_SLACK_WEBHOOK. Success fires only on a real (non-dry-run) publish that
+  # actually published at least one VSIX; failure fires when the publish job failed.
+  # Kept out of the publish job so a Slack hiccup can never fail an already-completed
+  # publish. Action SHA-pinned (SFSS-243) to v3.0.3, the release the guideline uses.
+  # ---------------------------------------------------------------------------
+  slack-notify:
+    name: Notify Slack (success)
+    needs: publish
+    if: always() && needs.publish.result == 'success' && needs.publish.outputs.published == 'true' && github.event.inputs.dry-run != 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Notify Slack
+        uses: slackapi/slack-github-action@45a88b9581bfab2566dc881e2cd66d334e621e2c # v3.0.3
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.IDEE_MAIN_SLACK_WEBHOOK }}
+        with:
+          payload: |
+            {
+              "text": "${{ github.event.inputs.slack-notification-title || '🌙 Pre-release (nightly/beta) published' }}",
+              "blocks": [
+                {
+                  "type": "header",
+                  "text": {
+                    "type": "plain_text",
+                    "text": "${{ github.event.inputs.slack-notification-title || '🌙 Pre-release (nightly/beta) published' }}"
+                  }
+                },
+                {
+                  "type": "section",
+                  "fields": [
+                    { "type": "mrkdwn", "text": "*Channel:*\npre-release (nightly/beta)" },
+                    { "type": "mrkdwn", "text": "*Marketplaces:*\nVS Code Marketplace + Open VSX" },
+                    { "type": "mrkdwn", "text": "*Repository:*\n${{ github.repository }}" },
+                    { "type": "mrkdwn", "text": "*Published:*\n${{ needs.publish.outputs.summary }}" }
+                  ]
+                },
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "*Workflow Run:* <${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View Details>"
+                  }
+                }
+              ]
+            }
+
+  slack-notify-failure:
+    name: Notify Slack (failure)
+    needs: publish
+    if: always() && needs.publish.result == 'failure'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Notify Slack
+        uses: slackapi/slack-github-action@45a88b9581bfab2566dc881e2cd66d334e621e2c # v3.0.3
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.IDEE_MAIN_SLACK_WEBHOOK }}
+        with:
+          payload: |
+            {
+              "text": "❌ Nightly/beta pre-release publish failed",
+              "blocks": [
+                {
+                  "type": "header",
+                  "text": {
+                    "type": "plain_text",
+                    "text": "❌ Nightly/beta pre-release publish failed"
+                  }
+                },
+                {
+                  "type": "section",
+                  "fields": [
+                    { "type": "mrkdwn", "text": "*Channel:*\npre-release (nightly/beta)" },
+                    { "type": "mrkdwn", "text": "*Repository:*\n${{ github.repository }}" }
+                  ]
+                },
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "*Workflow Run:* <${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View Details>"
+                  }
+                },
+                {
+                  "type": "context",
+                  "elements": [
+                    { "type": "mrkdwn", "text": "A verification (sha256/SLSA) or publish step failed. Check the workflow logs." }
+                  ]
+                }
+              ]
+            }

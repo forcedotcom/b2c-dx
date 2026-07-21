@@ -1,13 +1,30 @@
 name: Receive monorepo VSIX release
 
-# Trust boundary: this workflow is triggered by a repository_dispatch fired from
-# the monorepo (SalesforceCommerceCloud/b2c-developer-tooling) after it builds,
-# attests, and releases a new VSIX. A repository_dispatch payload is NOT
-# authenticated — any token with dispatch scope on this repo can send one and
-# *claim* any monorepo_repo. Therefore the allowlist below is only a cheap sanity
-# filter; the real trust anchor is `gh attestation verify`, which cryptographically
-# proves the VSIX was built by the monorepo's publish.yml. We fail closed here so a
-# spoofed or tampered dispatch never even opens a PR.
+# Trust boundary: this workflow is triggered by a repository_dispatch fired by the
+# poll (poll-monorepo-release.yml) — the pull-based stand-in for a push from the
+# monorepo (SalesforceCommerceCloud/b2c-developer-tooling). A repository_dispatch
+# payload is NOT authenticated — any token with dispatch scope on this repo can
+# send one and *claim* any monorepo_repo/version. Therefore the payload is treated
+# as a hint only: it says WHICH release to look at, nothing more. This job re-reads
+# the monorepo release's authoritative facts (isPrerelease + asset list), downloads
+# every VSIX, and re-verifies sha256 + SLSA build provenance from scratch. The real
+# trust anchor is `gh attestation verify`, which cryptographically proves each VSIX
+# was built by the monorepo's publish.yml ON MAIN. We fail closed so a spoofed or
+# tampered dispatch never even opens a PR.
+#
+# Build-once model (phase 1): a monorepo extension release can carry ONE or TWO VSIX
+# and be prerelease or not:
+#   * direct-stable release  -> prerelease=false, ONE even-minor VSIX (stable).
+#   * rc release (build-once) -> prerelease=true,  TWO VSIX — an ODD-minor rc VSIX
+#     (published now to the pre-release channel) AND an EVEN-minor stable VSIX
+#     (published later, on promotion — see promote-on-flip.yml). Both are attested
+#     here and recorded in the marker; the release is mirrored as prerelease.
+# Channel is decided by VSIX MINOR parity (odd = pre-release, even = stable), which
+# the monorepo's marketplace-version scheme guarantees.
+#
+# The b2c-dx release tag/marker identity is the monorepo's changeset semver
+# (b2c-vs-extension@X.Y.Z) — NOT the marketplace version baked into the VSIX. Each
+# VSIX is published at its own baked marketplace version; the marker records both.
 #
 # On success this opens a release PR (using this repo's own GITHUB_TOKEN — the
 # external credential never writes here). Merging that PR triggers
@@ -37,12 +54,12 @@ jobs:
     env:
       # Allowlisted source repo. Override via repo variable for sandbox testing.
       EXPECTED_MONOREPO: ${{ vars.EXPECTED_MONOREPO || 'SalesforceCommerceCloud/b2c-developer-tooling' }}
-      # Raw, untrusted payload — validated before any use.
+      # Raw, untrusted payload — validated before any use. Note: no sha256 and no
+      # prerelease flag are trusted from the payload; both are re-derived below.
       IN_VERSION: ${{ github.event.client_payload.version }}
       IN_MONOREPO_REPO: ${{ github.event.client_payload.monorepo_repo }}
       IN_MONOREPO_TAG: ${{ github.event.client_payload.monorepo_tag }}
       IN_RELEASE_URL: ${{ github.event.client_payload.release_url }}
-      IN_VSIX_SHA256: ${{ github.event.client_payload.vsix_sha256 }}
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
       - name: Validate and allowlist payload
@@ -60,8 +77,6 @@ jobs:
           # 2) Strict shape checks (fail closed on anything unexpected).
           echo "$IN_VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$' \
             || fail "version '$IN_VERSION' is not a valid semver"
-          echo "$IN_VSIX_SHA256" | grep -Eq '^[a-f0-9]{64}$' \
-            || fail "vsix_sha256 '$IN_VSIX_SHA256' is not a 64-char hex digest"
           if [ "$IN_MONOREPO_TAG" != "b2c-vs-extension@${IN_VERSION}" ]; then
             fail "monorepo_tag '$IN_MONOREPO_TAG' does not match expected 'b2c-vs-extension@${IN_VERSION}'"
           fi
@@ -79,55 +94,88 @@ jobs:
             echo "version=$IN_VERSION"
             echo "monorepo_repo=$IN_MONOREPO_REPO"
             echo "monorepo_tag=$IN_MONOREPO_TAG"
-            echo "vsix_sha256=$IN_VSIX_SHA256"
             echo "release_tag=$RELEASE_TAG"
             echo "branch=release/b2c-vs-extension-${IN_VERSION}"
           } >> "$GITHUB_OUTPUT"
 
-      - name: Download VSIX from monorepo release
+      # Read the monorepo release's AUTHORITATIVE facts: is it a prerelease, and
+      # which .vsix assets does it carry? Everything downstream keys off this, not
+      # the (untrusted) dispatch payload. We then download every VSIX, classify each
+      # by minor parity (odd = pre-release channel, even = stable), compute its
+      # sha256, and SLSA-verify it. The per-channel records feed the marker.
+      - name: Resolve, download, and verify VSIX assets — fail closed
+        id: assets
         if: steps.validate.outputs.skip != 'true'
         env:
           MONOREPO_REPO: ${{ steps.validate.outputs.monorepo_repo }}
           MONOREPO_TAG: ${{ steps.validate.outputs.monorepo_tag }}
         run: |
           set -euo pipefail
+          fail() { echo "::error::$1"; exit 1; }
+
+          # Authoritative prerelease flag from the monorepo release itself.
+          MONO_PRERELEASE=$(gh release view "$MONOREPO_TAG" --repo "$MONOREPO_REPO" \
+            --json isPrerelease --jq '.isPrerelease')
+          [ "$MONO_PRERELEASE" = "true" ] || [ "$MONO_PRERELEASE" = "false" ] \
+            || fail "could not read isPrerelease for ${MONOREPO_REPO}@${MONOREPO_TAG}"
+          echo "mono_prerelease=$MONO_PRERELEASE" >> "$GITHUB_OUTPUT"
+
+          # Download every VSIX on the release.
           gh release download "$MONOREPO_TAG" \
             --repo "$MONOREPO_REPO" \
             --pattern '*.vsix' \
             --dir /tmp/vsix
-          VSIX=$(ls /tmp/vsix/*.vsix 2>/dev/null | head -n1)
-          [ -n "$VSIX" ] || { echo "::error::No .vsix asset on ${MONOREPO_REPO}@${MONOREPO_TAG}"; exit 1; }
-          echo "VSIX=$VSIX" >> "$GITHUB_ENV"
+          COUNT=$(ls /tmp/vsix/*.vsix 2>/dev/null | wc -l | tr -d ' ')
+          [ "$COUNT" -ge 1 ] || fail "no .vsix asset on ${MONOREPO_REPO}@${MONOREPO_TAG}"
 
-      - name: Verify VSIX integrity (sha256) — fail closed
-        if: steps.validate.outputs.skip != 'true'
-        env:
-          EXPECTED_SHA: ${{ steps.validate.outputs.vsix_sha256 }}
-        run: |
-          set -euo pipefail
-          ACTUAL_SHA=$(sha256sum "$VSIX" | awk '{print $1}')
-          if [ "$ACTUAL_SHA" != "$EXPECTED_SHA" ]; then
-            echo "::error::VSIX sha256 mismatch. expected=$EXPECTED_SHA actual=$ACTUAL_SHA"
-            exit 1
+          # Classify each VSIX by MINOR parity and record {file, marketplaceVersion,
+          # sha256} per channel. SLSA-verify each one — a foreign/tampered VSIX on
+          # the release aborts the whole receive.
+          PRE_FILE=""; PRE_VER=""; PRE_SHA=""
+          STABLE_FILE=""; STABLE_VER=""; STABLE_SHA=""
+          for path in /tmp/vsix/*.vsix; do
+            f=$(basename "$path")
+            # Filename is b2c-vs-extension-<M>.<m>.<p>.vsix; the marketplace version
+            # is the exact bytes baked into the .vsix by the monorepo.
+            mkt=$(printf '%s\n' "$f" | sed -nE 's/^b2c-vs-extension-([0-9]+\.[0-9]+\.[0-9]+)\.vsix$/\1/p')
+            [ -n "$mkt" ] || fail "VSIX '$f' does not match the expected b2c-vs-extension-X.Y.Z.vsix naming"
+            minor=$(printf '%s\n' "$mkt" | cut -d. -f2)
+
+            gh attestation verify "$path" \
+              --repo "$MONOREPO_REPO" \
+              --signer-workflow "${MONOREPO_REPO}/.github/workflows/publish.yml" \
+              --source-ref refs/heads/main
+
+            sha=$(sha256sum "$path" | awk '{print $1}')
+
+            if [ $((minor % 2)) -eq 1 ]; then
+              [ -z "$PRE_FILE" ] || fail "more than one odd-minor (pre-release) VSIX on the release"
+              PRE_FILE="$f"; PRE_VER="$mkt"; PRE_SHA="$sha"
+              echo "::notice::pre-release VSIX $f (marketplace $mkt) sha256=$sha"
+            else
+              [ -z "$STABLE_FILE" ] || fail "more than one even-minor (stable) VSIX on the release"
+              STABLE_FILE="$f"; STABLE_VER="$mkt"; STABLE_SHA="$sha"
+              echo "::notice::stable VSIX $f (marketplace $mkt) sha256=$sha"
+            fi
+          done
+
+          # Shape sanity per release type: a prerelease (rc build-once) must carry
+          # the odd-minor rc asset; a non-prerelease (direct-stable or promoted)
+          # must carry the even-minor stable asset.
+          if [ "$MONO_PRERELEASE" = "true" ]; then
+            [ -n "$PRE_FILE" ] || fail "monorepo release is prerelease but carries no odd-minor rc VSIX"
+          else
+            [ -n "$STABLE_FILE" ] || fail "monorepo release is not prerelease but carries no even-minor stable VSIX"
           fi
-          echo "::notice::VSIX sha256 verified: $ACTUAL_SHA"
 
-      - name: Verify build provenance (SLSA attestation) — trust anchor, fail closed
-        if: steps.validate.outputs.skip != 'true'
-        env:
-          MONOREPO_REPO: ${{ steps.validate.outputs.monorepo_repo }}
-        run: |
-          set -euo pipefail
-          # Cryptographically proves the VSIX was produced by the monorepo's
-          # publish.yml workflow ON MAIN. This is what makes the unauthenticated
-          # dispatch safe: a forged event cannot forge this attestation.
-          # --signer-workflow pins the workflow path; --source-ref additionally
-          # pins the git ref, so a VSIX built+attested from any other branch
-          # (reachable via workflow_dispatch on an attacker branch) is rejected.
-          gh attestation verify "$VSIX" \
-            --repo "$MONOREPO_REPO" \
-            --signer-workflow "${MONOREPO_REPO}/.github/workflows/publish.yml" \
-            --source-ref refs/heads/main
+          {
+            echo "pre_file=$PRE_FILE"
+            echo "pre_version=$PRE_VER"
+            echo "pre_sha=$PRE_SHA"
+            echo "stable_file=$STABLE_FILE"
+            echo "stable_version=$STABLE_VER"
+            echo "stable_sha=$STABLE_SHA"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Checkout b2c-dx
         if: steps.validate.outputs.skip != 'true'
@@ -139,7 +187,13 @@ jobs:
           VERSION: ${{ steps.validate.outputs.version }}
           MONOREPO_REPO: ${{ steps.validate.outputs.monorepo_repo }}
           MONOREPO_TAG: ${{ steps.validate.outputs.monorepo_tag }}
-          VSIX_SHA256: ${{ steps.validate.outputs.vsix_sha256 }}
+          MONO_PRERELEASE: ${{ steps.assets.outputs.mono_prerelease }}
+          PRE_FILE: ${{ steps.assets.outputs.pre_file }}
+          PRE_VERSION: ${{ steps.assets.outputs.pre_version }}
+          PRE_SHA: ${{ steps.assets.outputs.pre_sha }}
+          STABLE_FILE: ${{ steps.assets.outputs.stable_file }}
+          STABLE_VERSION: ${{ steps.assets.outputs.stable_version }}
+          STABLE_SHA: ${{ steps.assets.outputs.stable_sha }}
         run: |
           set -euo pipefail
 
@@ -174,8 +228,13 @@ jobs:
           path.write_text(text)
           PY
 
-          # Immutable per-version marker + the mutable latest pointer. Both carry
-          # the VSIX sha256 so release-on-merge can re-verify integrity.
+          # Immutable per-version marker + the mutable latest pointer. The marker's
+          # release identity is the changeset semver; the `channels` map records each
+          # VSIX's own marketplace version + sha256 so release-on-merge and the
+          # publishers can re-verify and publish each asset at ITS version. Only the
+          # channels present on the release are written (direct-stable -> stable
+          # only; rc build-once -> both). `monorepoPrerelease` records the phase-1
+          # release state so downstream mirrors it.
           mkdir -p releases
           write_marker() {
             jq -n \
@@ -183,13 +242,27 @@ jobs:
               --arg tag "$MONOREPO_TAG" \
               --arg repo "$MONOREPO_REPO" \
               --arg url "$RELEASE_URL" \
-              --arg sha "$VSIX_SHA256" \
+              --argjson prerelease "$MONO_PRERELEASE" \
+              --arg preFile "$PRE_FILE" \
+              --arg preVer "$PRE_VERSION" \
+              --arg preSha "$PRE_SHA" \
+              --arg stableFile "$STABLE_FILE" \
+              --arg stableVer "$STABLE_VERSION" \
+              --arg stableSha "$STABLE_SHA" \
               '{
                 version: $version,
                 monorepoTag: $tag,
                 monorepoRepo: $repo,
                 monorepoReleaseUrl: $url,
-                vsixSha256: $sha
+                monorepoPrerelease: $prerelease,
+                channels: (
+                  ( if $preFile != "" then
+                      { prerelease: { vsixFile: $preFile, marketplaceVersion: $preVer, vsixSha256: $preSha } }
+                    else {} end )
+                  + ( if $stableFile != "" then
+                        { stable: { vsixFile: $stableFile, marketplaceVersion: $stableVer, vsixSha256: $stableSha } }
+                      else {} end )
+                )
               }' > "$1"
           }
           write_marker "releases/${VERSION}.json"
@@ -201,8 +274,14 @@ jobs:
           VERSION: ${{ steps.validate.outputs.version }}
           MONOREPO_REPO: ${{ steps.validate.outputs.monorepo_repo }}
           MONOREPO_TAG: ${{ steps.validate.outputs.monorepo_tag }}
-          VSIX_SHA256: ${{ steps.validate.outputs.vsix_sha256 }}
           BRANCH: ${{ steps.validate.outputs.branch }}
+          MONO_PRERELEASE: ${{ steps.assets.outputs.mono_prerelease }}
+          PRE_FILE: ${{ steps.assets.outputs.pre_file }}
+          PRE_VERSION: ${{ steps.assets.outputs.pre_version }}
+          PRE_SHA: ${{ steps.assets.outputs.pre_sha }}
+          STABLE_FILE: ${{ steps.assets.outputs.stable_file }}
+          STABLE_VERSION: ${{ steps.assets.outputs.stable_version }}
+          STABLE_SHA: ${{ steps.assets.outputs.stable_sha }}
         run: |
           set -euo pipefail
 
@@ -222,6 +301,15 @@ jobs:
           RELEASE_TAG="b2c-vs-extension@${VERSION}"
           RELEASE_URL="https://github.com/${MONOREPO_REPO}/releases/tag/${MONOREPO_TAG}"
 
+          # Human summary of what this release will publish, and when. A prerelease
+          # (rc build-once) publishes the pre-release channel on merge and the stable
+          # channel later on promotion; a direct-stable release publishes stable now.
+          if [ "$MONO_PRERELEASE" = "true" ]; then
+            CHANNEL_LINE="Release candidate (pre-release channel) now; stable on promotion."
+          else
+            CHANNEL_LINE="Stable channel."
+          fi
+
           # Build the PR body with printf (format string is single-quoted, so the
           # env values below cannot inject markup or shell). The changelog section
           # was extracted from the verified source in the assemble step.
@@ -229,15 +317,25 @@ jobs:
           {
             printf '## Release `%s`\n\n' "$RELEASE_TAG"
             printf 'Promotes **v%s** of the B2C DX VS Code extension for publishing to the VS Code Marketplace and Open VSX.\n\n' "$VERSION"
+            printf '%s\n\n' "$CHANNEL_LINE"
 
             printf '### Release details\n\n'
             printf '| | |\n|---|---|\n'
-            printf '| Version | `%s` |\n' "$VERSION"
             printf '| Release tag (this repo) | `%s` |\n' "$RELEASE_TAG"
             printf '| Source repo | `%s` |\n' "$MONOREPO_REPO"
             printf '| Source release | [`%s`](%s) |\n' "$MONOREPO_TAG" "$RELEASE_URL"
-            printf '| VSIX SHA-256 | `%s` |\n' "$VSIX_SHA256"
-            printf '| Provenance | ✅ SLSA build provenance verified (built on `main`) |\n\n'
+            printf '| Source is pre-release | `%s` |\n' "$MONO_PRERELEASE"
+            printf '| Provenance | ✅ SLSA build provenance verified for every asset (built on `main`) |\n\n'
+
+            printf '### Marketplace artifacts\n\n'
+            printf '| Channel | Marketplace version | File | VSIX SHA-256 |\n|---|---|---|---|\n'
+            if [ -n "$PRE_FILE" ]; then
+              printf '| pre-release | `%s` | `%s` | `%s` |\n' "$PRE_VERSION" "$PRE_FILE" "$PRE_SHA"
+            fi
+            if [ -n "$STABLE_FILE" ]; then
+              printf '| stable | `%s` | `%s` | `%s` |\n' "$STABLE_VERSION" "$STABLE_FILE" "$STABLE_SHA"
+            fi
+            printf '\n'
 
             printf '### What'\''s changing\n\n'
             # Drop the redundant leading "## <version>" heading and any leading
@@ -248,16 +346,21 @@ jobs:
 
             printf '### Files in this PR\n\n'
             printf -- '- `CHANGELOG.md` — new `## %s` section (mirrors the source changelog)\n' "$VERSION"
-            printf -- '- `releases/%s.json` — immutable release marker (version, source tag, VSIX SHA-256)\n' "$VERSION"
+            printf -- '- `releases/%s.json` — immutable release marker (source tag, per-channel VSIX versions + SHA-256)\n' "$VERSION"
             printf -- '- `releases/latest.json` — pointer updated to this version\n\n'
 
             printf '### What happens on merge\n\n'
-            printf '1. `release-on-merge` re-verifies the VSIX SHA-256 and SLSA build provenance.\n'
-            printf '2. Creates the `%s` release in this repo with the VSIX attached.\n' "$RELEASE_TAG"
-            printf '3. Triggers `publish-vscode` and `publish-openvsx` (gated by the `publish` environment), which verify provenance once more, then publish.\n\n'
+            if [ "$MONO_PRERELEASE" = "true" ]; then
+              printf '1. `release-on-merge` re-verifies both VSIX (SHA-256 + SLSA) and creates the `%s` **pre-release** in this repo with both VSIX attached.\n' "$RELEASE_TAG"
+              printf '2. Triggers `publish-vscode`/`publish-openvsx` with `channel=prerelease` (gated by the `publish` environment), which publish the pre-release VSIX with `--pre-release`.\n'
+              printf '3. Later, when the monorepo promotes this release to stable, `promote-on-flip` flips this release to released and publishes the stable VSIX — the exact bytes verified here, never rebuilt.\n\n'
+            else
+              printf '1. `release-on-merge` re-verifies the stable VSIX (SHA-256 + SLSA) and creates the `%s` release in this repo with the VSIX attached.\n' "$RELEASE_TAG"
+              printf '2. Triggers `publish-vscode`/`publish-openvsx` with `channel=stable` (gated by the `publish` environment), which verify provenance once more, then publish.\n\n'
+            fi
 
             printf '### Automated checks on this PR\n\n'
-            printf -- '- `release-provenance` — the receiver verified the VSIX SHA-256 + SLSA provenance before opening this PR.\n'
+            printf -- '- `release-provenance` — the receiver verified every VSIX SHA-256 + SLSA provenance before opening this PR.\n'
             printf -- '- `validate-release-pr` — an independent workflow re-downloads the VSIX and re-verifies SHA-256 + provenance from scratch against the committed marker.\n\n'
             printf 'Both must be green before merge (enforce via branch protection). Merging is blocked until they pass.\n\n'
 
@@ -267,7 +370,7 @@ jobs:
             printf -- '- [ ] `release-provenance` and `validate-release-pr` checks are green\n\n'
 
             printf -- '---\n'
-            printf '_Opened automatically by `receive-monorepo-release` after verifying the artifact. The VSIX SHA-256 and SLSA build provenance were checked before this PR was opened._\n'
+            printf '_Opened automatically by `receive-monorepo-release` after verifying the artifact(s). Every VSIX SHA-256 and SLSA build provenance were checked before this PR was opened._\n'
           } > "$PR_BODY_FILE"
 
           if gh pr view "$BRANCH" --repo "${{ github.repository }}" >/dev/null 2>&1; then
@@ -292,7 +395,8 @@ jobs:
         env:
           VERSION: ${{ steps.validate.outputs.version }}
           BRANCH: ${{ steps.validate.outputs.branch }}
-          VSIX_SHA256: ${{ steps.validate.outputs.vsix_sha256 }}
+          PRE_SHA: ${{ steps.assets.outputs.pre_sha }}
+          STABLE_SHA: ${{ steps.assets.outputs.stable_sha }}
           THIS_REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
@@ -300,13 +404,19 @@ jobs:
           # Head commit of the release branch = the PR head. Checks attach to this SHA.
           HEAD_SHA=$(git rev-parse HEAD)
 
-          # (A) Audit check-run: record that the receiver verified the artifact BEFORE
-          # opening the PR. Created via the API (not an event), so the GITHUB_TOKEN
-          # recursion guard does not suppress it — it shows in the PR's checks list.
+          # Human-readable digest summary for the audit check-run.
+          DIGESTS=""
+          [ -n "$PRE_SHA" ]    && DIGESTS="${DIGESTS}pre-release=${PRE_SHA} "
+          [ -n "$STABLE_SHA" ] && DIGESTS="${DIGESTS}stable=${STABLE_SHA}"
+
+          # (A) Audit check-run: record that the receiver verified the artifact(s)
+          # BEFORE opening the PR. Created via the API (not an event), so the
+          # GITHUB_TOKEN recursion guard does not suppress it — it shows in the PR's
+          # checks list.
           jq -n \
             --arg sha "$HEAD_SHA" \
             --arg v "$VERSION" \
-            --arg digest "$VSIX_SHA256" \
+            --arg digests "$DIGESTS" \
             '{
               name: "release-provenance",
               head_sha: $sha,
@@ -314,7 +424,7 @@ jobs:
               conclusion: "success",
               output: {
                 title: ("Provenance verified for " + $v),
-                summary: ("VSIX SHA-256 `" + $digest + "` and SLSA build provenance were verified against the allowlisted monorepo before this PR was opened.")
+                summary: ("Every VSIX (" + $digests + ") and its SLSA build provenance were verified against the allowlisted monorepo before this PR was opened.")
               }
             }' \
           | gh api "repos/${THIS_REPO}/check-runs" --method POST --input -

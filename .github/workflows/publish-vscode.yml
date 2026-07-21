@@ -6,9 +6,17 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Release tag to publish (e.g. b2c-vs-extension@0.8.2). Leave empty to use the latest release.'
+        description: 'Release tag to publish (e.g. b2c-vs-extension@1.0.3). Leave empty to use the latest release.'
         required: false
         type: string
+      channel:
+        description: 'Which channel to publish: stable (even-minor VSIX) or prerelease (odd-minor rc VSIX). Defaults to stable.'
+        required: false
+        default: stable
+        type: choice
+        options:
+          - stable
+          - prerelease
       dry-run:
         description: 'Verify (provenance + marker) but do NOT publish to the marketplace.'
         required: false
@@ -20,11 +28,15 @@ on:
         default: '🎉 Extensions Released Successfully!'
         type: string
 
-# Serialize publishes of the SAME tag; never cancel an in-flight upload. The prefix
-# is distinct per publisher (vscode/openvsx run in parallel) and distinct from
-# release-on-merge, so this only queues a duplicate publish of the same tag.
+# Serialize publishes of the SAME tag + channel; never cancel an in-flight upload.
+# The prefix is distinct per publisher (vscode/openvsx run in parallel) and distinct
+# from release-on-merge. Channel is in the key so a phase-1 pre-release publish and a
+# later phase-2 stable publish of the same tag do not block each other (they publish
+# different VSIX); same-tag same-channel re-dispatches still serialize. For the
+# `release` event (no inputs) the channel resolves to stable, matching the resolve
+# step below.
 concurrency:
-  group: publish-vscode-${{ github.event.release.tag_name || github.event.inputs.tag || github.ref }}
+  group: publish-vscode-${{ github.event.release.tag_name || github.event.inputs.tag || github.ref }}-${{ github.event.inputs.channel || 'stable' }}
   cancel-in-progress: false
 
 jobs:
@@ -37,6 +49,7 @@ jobs:
     outputs:
       tag: ${{ steps.tag.outputs.tag }}
       version: ${{ steps.tag.outputs.version }}
+      channel: ${{ steps.tag.outputs.channel }}
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       # Trust identity for provenance verification. Hard-coded (NOT a repo variable)
@@ -48,6 +61,7 @@ jobs:
       EVENT_NAME: ${{ github.event_name }}
       RELEASE_TAG_NAME: ${{ github.event.release.tag_name }}
       INPUT_TAG: ${{ github.event.inputs.tag }}
+      INPUT_CHANNEL: ${{ github.event.inputs.channel }}
       THIS_REPO: ${{ github.repository }}
     steps:
       # Checkout main to read the committed per-version release markers. Markers
@@ -60,7 +74,7 @@ jobs:
         with:
           node-version: ${{ vars.NODE_VERSION || 'lts/*' }}
 
-      - name: Resolve release tag
+      - name: Resolve release tag and channel
         id: tag
         run: |
           set -euo pipefail
@@ -80,26 +94,62 @@ jobs:
             echo "::error::Refusing to publish unexpected tag '$TAG'"
             exit 1
           fi
-          echo "Publishing tag: $TAG"
+
+          # Resolve the channel. A `released` GitHub event is only ever fired for a
+          # NON-prerelease release, so it is always a stable publish (this is also a
+          # safety net for a human-flipped release). Otherwise honor the dispatch
+          # input, defaulting to stable. Only these two values are accepted.
+          if [ "$EVENT_NAME" = "release" ]; then
+            CHANNEL="stable"
+          else
+            CHANNEL="${INPUT_CHANNEL:-stable}"
+          fi
+          case "$CHANNEL" in
+            stable|prerelease) : ;;
+            *) echo "::error::Invalid channel '$CHANNEL' (expected stable|prerelease)"; exit 1 ;;
+          esac
+
+          echo "Publishing tag: $TAG (channel=$CHANNEL)"
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "version=${TAG#b2c-vs-extension@}" >> "$GITHUB_OUTPUT"
+          echo "channel=$CHANNEL" >> "$GITHUB_OUTPUT"
 
-      - name: Download VSIX from release
+      # Select THIS channel's exact VSIX from the committed, PR-reviewed marker and
+      # download only that file. A build-once rc release carries TWO VSIX (odd-minor
+      # pre-release + even-minor stable), so we cannot assume a single asset — the
+      # marker names the file per channel, and that name is the integrity binding.
+      - name: Download the channel's VSIX from release
         id: download
         env:
           TAG: ${{ steps.tag.outputs.tag }}
+          VERSION: ${{ steps.tag.outputs.version }}
+          CHANNEL: ${{ steps.tag.outputs.channel }}
         run: |
           set -euo pipefail
-          gh release download "$TAG" \
-            --repo "$THIS_REPO" \
-            --pattern '*.vsix' \
-            --dir /tmp/vsix
-          COUNT=$(ls /tmp/vsix/*.vsix 2>/dev/null | wc -l | tr -d ' ')
-          if [ "$COUNT" -ne 1 ]; then
-            echo "::error::Expected exactly one .vsix on release $TAG, found $COUNT"
+          MARKER="releases/${VERSION}.json"
+          if [ ! -f "$MARKER" ]; then
+            echo "::error::No committed marker $MARKER on main; refusing to publish a release with no reviewed marker"
             exit 1
           fi
-          VSIX=$(ls /tmp/vsix/*.vsix)
+          VSIX_FILE=$(jq -r --arg c "$CHANNEL" '.channels[$c].vsixFile // empty' "$MARKER")
+          if [ -z "$VSIX_FILE" ]; then
+            echo "::error::marker $MARKER has no channels.$CHANNEL.vsixFile — nothing to publish for this channel"
+            exit 1
+          fi
+          # Constrain the marker-provided filename before using it as a download
+          # pattern (defense in depth; the marker is reviewed but re-validate shape).
+          echo "$VSIX_FILE" | grep -Eq '^b2c-vs-extension-[0-9]+\.[0-9]+\.[0-9]+\.vsix$' \
+            || { echo "::error::marker vsixFile '$VSIX_FILE' has an unexpected shape"; exit 1; }
+
+          gh release download "$TAG" \
+            --repo "$THIS_REPO" \
+            --pattern "$VSIX_FILE" \
+            --dir /tmp/vsix
+          VSIX="/tmp/vsix/${VSIX_FILE}"
+          if [ ! -f "$VSIX" ]; then
+            echo "::error::Channel '$CHANNEL' VSIX '$VSIX_FILE' not found on release $TAG"
+            exit 1
+          fi
           echo "Downloaded VSIX: $VSIX"
           echo "vsix=$VSIX" >> "$GITHUB_OUTPUT"
 
@@ -126,6 +176,7 @@ jobs:
         env:
           VSIX: ${{ steps.download.outputs.vsix }}
           VERSION: ${{ steps.tag.outputs.version }}
+          CHANNEL: ${{ steps.tag.outputs.channel }}
         run: |
           set -euo pipefail
           MARKER="releases/${VERSION}.json"
@@ -133,15 +184,15 @@ jobs:
             echo "::error::No committed marker $MARKER on main; refusing to publish a release with no reviewed marker"
             exit 1
           fi
-          EXPECTED_SHA=$(jq -r '.vsixSha256 // empty' "$MARKER")
+          EXPECTED_SHA=$(jq -r --arg c "$CHANNEL" '.channels[$c].vsixSha256 // empty' "$MARKER")
           echo "$EXPECTED_SHA" | grep -Eq '^[a-f0-9]{64}$' \
-            || { echo "::error::marker $MARKER vsixSha256 missing/malformed"; exit 1; }
+            || { echo "::error::marker $MARKER channels.$CHANNEL.vsixSha256 missing/malformed"; exit 1; }
           ACTUAL_SHA=$(sha256sum "$VSIX" | awk '{print $1}')
           if [ "$ACTUAL_SHA" != "$EXPECTED_SHA" ]; then
-            echo "::error::VSIX sha256 does not match $MARKER. expected=$EXPECTED_SHA actual=$ACTUAL_SHA"
+            echo "::error::VSIX sha256 does not match $MARKER (channel $CHANNEL). expected=$EXPECTED_SHA actual=$ACTUAL_SHA"
             exit 1
           fi
-          echo "::notice::VSIX matches committed marker $MARKER"
+          echo "::notice::VSIX matches committed marker $MARKER (channel $CHANNEL)"
 
       # Publish via the IDEE-maintained composite action (the same publish primitive
       # salesforcecli/github-workflows' own vscode workflows call). It runs vsce
@@ -156,7 +207,9 @@ jobs:
         with:
           vsix-path: ${{ steps.download.outputs.vsix }}
           publish-tool: vsce
-          pre-release: 'false'
+          # Odd-minor rc VSIX -> Marketplace pre-release channel; even-minor stable
+          # VSIX -> regular channel. The action's pre-release input is a string.
+          pre-release: ${{ steps.tag.outputs.channel == 'prerelease' && 'true' || 'false' }}
           dry-run: ${{ github.event.inputs.dry-run || 'false' }}
         env:
           VSCE_PERSONAL_ACCESS_TOKEN: ${{ secrets.VSCE_PERSONAL_ACCESS_TOKEN }}
@@ -209,6 +262,7 @@ jobs:
                   "type": "section",
                   "fields": [
                     { "type": "mrkdwn", "text": "*Marketplace:*\nVS Code Marketplace" },
+                    { "type": "mrkdwn", "text": "*Channel:*\n${{ needs.publish.outputs.channel }}" },
                     { "type": "mrkdwn", "text": "*Repository:*\n${{ github.repository }}" },
                     { "type": "mrkdwn", "text": "*Tag:*\n${{ needs.publish.outputs.tag }}" },
                     { "type": "mrkdwn", "text": "*Version:*\n${{ needs.publish.outputs.version }}" }

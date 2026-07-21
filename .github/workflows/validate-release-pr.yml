@@ -3,9 +3,10 @@ name: Validate release PR
 # Independent, gating re-verification of a release PR. This is the check a
 # reviewer (and branch protection) can rely on: it does NOT trust the receiver's
 # earlier verification — it re-reads the committed releases/<version>.json marker,
-# re-downloads the VSIX from the allowlisted monorepo, and re-verifies the SHA-256
-# and SLSA build provenance from scratch. It also confirms the marker is
-# internally consistent (version/tag/sha shape).
+# re-downloads EVERY VSIX the marker names (build-once rc markers carry two — an
+# odd-minor pre-release and an even-minor stable), and re-verifies each one's
+# SHA-256 and SLSA build provenance from scratch. It also confirms the marker is
+# internally consistent (version/tag shape + at least one well-formed channel).
 #
 # Two triggers:
 #   * workflow_dispatch — the primary path. receive-monorepo-release.yml opens the
@@ -152,40 +153,52 @@ jobs:
 
           MONOREPO_REPO=$(jq -r '.monorepoRepo // empty' "$MARKER")
           MONOREPO_TAG=$(jq -r '.monorepoTag // empty' "$MARKER")
-          MARKER_SHA=$(jq -r '.vsixSha256 // empty' "$MARKER")
 
           # Allowlist + internal-consistency checks on the committed marker.
           [ "$MONOREPO_REPO" = "$EXPECTED_MONOREPO" ] \
             || fail "marker monorepoRepo '$MONOREPO_REPO' is not the allowlisted '$EXPECTED_MONOREPO'"
           [ "$MONOREPO_TAG" = "b2c-vs-extension@${VERSION}" ] \
             || fail "marker monorepoTag '$MONOREPO_TAG' does not match 'b2c-vs-extension@${VERSION}'"
-          echo "$MARKER_SHA" | grep -Eq '^[a-f0-9]{64}$' \
-            || fail "marker vsixSha256 is missing or malformed"
 
-          # Re-download the VSIX from the allowlisted monorepo release.
-          gh release download "$MONOREPO_TAG" \
-            --repo "$MONOREPO_REPO" \
-            --pattern '*.vsix' \
-            --dir /tmp/vsix
-          COUNT=$(ls /tmp/vsix/*.vsix 2>/dev/null | wc -l | tr -d ' ')
-          [ "$COUNT" -eq 1 ] || fail "expected exactly one .vsix on ${MONOREPO_REPO}@${MONOREPO_TAG}, found $COUNT"
-          VSIX=$(ls /tmp/vsix/*.vsix)
+          # Re-verify EVERY channel the marker names, from scratch. A build-once rc
+          # marker carries two (odd-minor pre-release + even-minor stable); a
+          # direct-stable marker carries one. Each: pull that exact file from the
+          # allowlisted monorepo release, re-check its sha256 against the marker, and
+          # re-verify SLSA build provenance. At least one channel must be present.
+          VERIFIED=0
+          for channel in prerelease stable; do
+            FILE=$(jq -r --arg c "$channel" '.channels[$c].vsixFile // empty' "$MARKER")
+            [ -n "$FILE" ] || continue
+            echo "$FILE" | grep -Eq '^b2c-vs-extension-[0-9]+\.[0-9]+\.[0-9]+\.vsix$' \
+              || fail "marker channels.$channel.vsixFile '$FILE' has an unexpected shape"
+            MARKER_SHA=$(jq -r --arg c "$channel" '.channels[$c].vsixSha256 // empty' "$MARKER")
+            echo "$MARKER_SHA" | grep -Eq '^[a-f0-9]{64}$' \
+              || fail "marker channels.$channel.vsixSha256 is missing or malformed"
 
-          # Re-verify integrity against the committed marker (independent of the
-          # receiver's earlier check).
-          ACTUAL_SHA=$(sha256sum "$VSIX" | awk '{print $1}')
-          [ "$ACTUAL_SHA" = "$MARKER_SHA" ] \
-            || fail "VSIX sha256 mismatch: marker=$MARKER_SHA actual=$ACTUAL_SHA"
+            rm -rf /tmp/vsix && mkdir -p /tmp/vsix
+            gh release download "$MONOREPO_TAG" \
+              --repo "$MONOREPO_REPO" \
+              --pattern "$FILE" \
+              --dir /tmp/vsix
+            VSIX="/tmp/vsix/${FILE}"
+            [ -f "$VSIX" ] || fail "channel $channel asset '$FILE' not found on ${MONOREPO_REPO}@${MONOREPO_TAG}"
 
-          # Re-verify SLSA build provenance from scratch. Pins the workflow path and
-          # the source ref, so only an artifact built + attested on the monorepo's
-          # main branch passes.
-          gh attestation verify "$VSIX" \
-            --repo "$MONOREPO_REPO" \
-            --signer-workflow "${MONOREPO_REPO}/.github/workflows/publish.yml" \
-            --source-ref refs/heads/main
+            ACTUAL_SHA=$(sha256sum "$VSIX" | awk '{print $1}')
+            [ "$ACTUAL_SHA" = "$MARKER_SHA" ] \
+              || fail "VSIX sha256 mismatch for $FILE (channel $channel): marker=$MARKER_SHA actual=$ACTUAL_SHA"
 
-          echo "::notice::Independent re-verification passed for b2c-vs-extension@${VERSION} ($ACTUAL_SHA)"
+            # Pins the workflow path and the source ref, so only an artifact built +
+            # attested on the monorepo's main branch passes.
+            gh attestation verify "$VSIX" \
+              --repo "$MONOREPO_REPO" \
+              --signer-workflow "${MONOREPO_REPO}/.github/workflows/publish.yml" \
+              --source-ref refs/heads/main
+            echo "::notice::re-verified $channel VSIX $FILE ($ACTUAL_SHA)"
+            VERIFIED=$((VERIFIED + 1))
+          done
+          [ "$VERIFIED" -ge 1 ] || fail "marker $MARKER names no channels (channels.prerelease/stable both absent)"
+
+          echo "::notice::Independent re-verification passed for b2c-vs-extension@${VERSION} ($VERIFIED channel(s))"
 
       - name: Post validate-release-pr check-run
         if: always()

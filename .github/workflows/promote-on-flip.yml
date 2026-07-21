@@ -1,0 +1,151 @@
+name: Promote release on monorepo flip
+
+# Phase 2 of the build-once lifecycle on the b2c-dx side. In phase 1 an rc release
+# was received and mirrored here as a PRE-RELEASE, and only its odd-minor
+# pre-release VSIX was published (see receive-monorepo-release.yml +
+# release-on-merge.yml). The even-minor stable VSIX rode along, attested and
+# recorded in the committed marker, but was NOT published.
+#
+# When the monorepo promotes that SAME release (promote.yml flips it to
+# non-prerelease/latest), the poll detects the flip and fires this workflow. Here we
+# flip OUR release to released and publish the stable VSIX — the exact bytes
+# verified in phase 1, never rebuilt. There is NO new human PR: the stable asset +
+# its sha256 were already reviewed in the phase-1 marker, the monorepo promotion is
+# itself human-gated (approval on its `publish` environment), and our own publishers
+# re-verify + are gated by our `publish` environment.
+#
+# Trust boundary is identical to the receiver: the repository_dispatch is
+# unauthenticated, so it is only a hint about WHICH release to look at. Before
+# mutating anything we (1) confirm the monorepo release is genuinely no longer a
+# prerelease, and (2) re-download the stable VSIX and re-verify sha256 (against the
+# committed marker) + SLSA build provenance from scratch, failing closed.
+
+on:
+  repository_dispatch:
+    types: [monorepo-vsx-promote]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to promote (e.g. 1.0.3). Must already exist here as a pre-release with a committed stable-channel marker.'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  # Never promote the same version twice concurrently; never cancel an in-flight
+  # flip (a half-applied promotion would desync the release from the publishers).
+  group: promote-on-flip-${{ github.event.client_payload.version || github.event.inputs.version }}
+  cancel-in-progress: false
+
+jobs:
+  promote:
+    name: Flip release to stable and publish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # flip the release (gh release edit)
+      actions: write # dispatch the publishers (workflow_dispatch)
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      EXPECTED_MONOREPO: ${{ vars.EXPECTED_MONOREPO || 'SalesforceCommerceCloud/b2c-developer-tooling' }}
+      THIS_REPO: ${{ github.repository }}
+      # Untrusted-ish inputs — bound to env, validated before use, never inlined.
+      IN_VERSION: ${{ github.event.client_payload.version || github.event.inputs.version }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: main
+
+      - name: Validate, re-verify stable VSIX, flip, and dispatch — fail closed
+        id: promote
+        run: |
+          set -euo pipefail
+          fail() { echo "::error::$1"; exit 1; }
+
+          # 1) Shape-check the version and derive the shared tag.
+          echo "$IN_VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$' \
+            || fail "version '$IN_VERSION' is not a valid semver"
+          VERSION="$IN_VERSION"
+          TAG="b2c-vs-extension@${VERSION}"
+
+          # 2) OUR release must exist and still be a pre-release. If it is missing,
+          #    phase 1 has not happened yet (let the poll re-drive receive first). If
+          #    it is already non-prerelease, promotion is done (idempotent no-op).
+          BD=$(gh release view "$TAG" --repo "$THIS_REPO" --json isPrerelease --jq '.isPrerelease' 2>/dev/null || echo absent)
+          if [ "$BD" = "absent" ]; then
+            echo "::notice::No release $TAG in $THIS_REPO yet; phase 1 not complete. Nothing to promote."
+            echo "skip=true" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          if [ "$BD" = "false" ]; then
+            echo "::notice::Release $TAG is already non-prerelease (already promoted); nothing to do."
+            echo "skip=true" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+
+          # 3) The monorepo's SAME release must genuinely be promoted (non-prerelease).
+          #    This is the authoritative signal; the dispatch payload is never trusted.
+          MONO=$(gh release view "$TAG" --repo "$EXPECTED_MONOREPO" --json isPrerelease --jq '.isPrerelease' 2>/dev/null || echo absent)
+          [ "$MONO" != "absent" ] || fail "monorepo release $TAG not found on $EXPECTED_MONOREPO"
+          if [ "$MONO" != "false" ]; then
+            echo "::notice::Monorepo release $TAG is still a prerelease (not promoted yet); will retry on the next poll."
+            echo "skip=true" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+
+          # 4) Read the committed, PR-reviewed marker's STABLE channel.
+          MARKER="releases/${VERSION}.json"
+          [ -f "$MARKER" ] || fail "committed marker $MARKER is missing on main"
+          MONOREPO_REPO=$(jq -r '.monorepoRepo // empty' "$MARKER")
+          [ "$MONOREPO_REPO" = "$EXPECTED_MONOREPO" ] \
+            || fail "marker monorepoRepo '$MONOREPO_REPO' is not the allowlisted '$EXPECTED_MONOREPO'"
+          STABLE_FILE=$(jq -r '.channels.stable.vsixFile // empty' "$MARKER")
+          STABLE_SHA=$(jq -r '.channels.stable.vsixSha256 // empty' "$MARKER")
+          [ -n "$STABLE_FILE" ] || fail "marker $MARKER has no channels.stable.vsixFile — cannot promote"
+          echo "$STABLE_FILE" | grep -Eq '^b2c-vs-extension-[0-9]+\.[0-9]+\.[0-9]+\.vsix$' \
+            || fail "marker channels.stable.vsixFile '$STABLE_FILE' has an unexpected shape"
+          echo "$STABLE_SHA" | grep -Eq '^[a-f0-9]{64}$' \
+            || fail "marker channels.stable.vsixSha256 is missing or malformed"
+
+          # 5) Re-verify the stable VSIX from scratch BEFORE mutating anything:
+          #    re-download the exact file, re-check its sha256 against the marker, and
+          #    re-verify SLSA build provenance (pinned to publish.yml on main).
+          rm -rf /tmp/vsix && mkdir -p /tmp/vsix
+          gh release download "$TAG" --repo "$MONOREPO_REPO" --pattern "$STABLE_FILE" --dir /tmp/vsix
+          VSIX="/tmp/vsix/${STABLE_FILE}"
+          [ -f "$VSIX" ] || fail "stable asset '$STABLE_FILE' not found on ${MONOREPO_REPO}@${TAG}"
+          ACTUAL_SHA=$(sha256sum "$VSIX" | awk '{print $1}')
+          [ "$ACTUAL_SHA" = "$STABLE_SHA" ] \
+            || fail "stable VSIX sha256 mismatch: marker=$STABLE_SHA actual=$ACTUAL_SHA"
+          gh attestation verify "$VSIX" \
+            --repo "$MONOREPO_REPO" \
+            --signer-workflow "${MONOREPO_REPO}/.github/workflows/publish.yml" \
+            --source-ref refs/heads/main
+          echo "::notice::stable VSIX $STABLE_FILE re-verified ($ACTUAL_SHA); flipping release."
+
+          # 6) Flip OUR release to released. Note this edit uses GITHUB_TOKEN, so the
+          #    `released` event it would fire is suppressed by GitHub's recursion
+          #    guard — the explicit workflow_dispatch below (guard-exempt) is what
+          #    actually drives the stable publish. Should a HUMAN later re-flip the
+          #    release, the publishers' `release:[released]` trigger resolves to
+          #    channel=stable and --skip-duplicate makes that a safe no-op.
+          gh release edit "$TAG" --repo "$THIS_REPO" --prerelease=false --latest
+
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+      # Dispatch the stable publish. workflow_dispatch is exempt from the recursion
+      # guard (unlike the release event the flip above would fire under GITHUB_TOKEN),
+      # so this is the actual driver. Each publisher re-verifies provenance and is
+      # gated by the `publish` environment before it touches a marketplace.
+      - name: Dispatch stable publish
+        if: steps.promote.outputs.skip != 'true'
+        env:
+          TAG: ${{ steps.promote.outputs.tag }}
+        run: |
+          set -euo pipefail
+          gh workflow run publish-vscode.yml \
+            --repo "$THIS_REPO" --ref main \
+            -f tag="$TAG" -f channel=stable
+          gh workflow run publish-openvsx.yml \
+            --repo "$THIS_REPO" --ref main \
+            -f tag="$TAG" -f channel=stable
+          echo "::notice::Promoted $TAG to stable and dispatched publishers (channel=stable)."

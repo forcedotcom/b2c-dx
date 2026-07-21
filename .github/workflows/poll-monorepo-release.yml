@@ -3,36 +3,52 @@ name: Poll monorepo for new VSIX release
 # Pull-based trigger for the release pipeline — the credential-free alternative to
 # the monorepo PUSHING a repository_dispatch (which needs a cross-repo GitHub App
 # or PAT). Instead, THIS repo pulls: on a schedule (and on demand) it checks the
-# monorepo's PUBLIC releases with its OWN GITHUB_TOKEN, and when it finds an
-# extension release we haven't processed yet, it fires a repository_dispatch to
-# ITSELF to wake receive-monorepo-release.yml — the exact same event the monorepo
-# push would have sent, so the receiver runs one unchanged code path.
+# monorepo's PUBLIC releases with its OWN GITHUB_TOKEN and, for each extension
+# release, decides what this repo still needs to do, then fires a
+# repository_dispatch to ITSELF to wake the matching worker.
+#
+# The build-once release model (see the monorepo's publish.yml + promote.yml) means
+# a single monorepo release has a two-phase lifecycle that this poll drives:
+#   * PHASE 1 (receive): the release is new to us. Fire `monorepo-vsx-release` ->
+#     receive-monorepo-release.yml opens a release PR; on merge we cut OUR release
+#     (mirroring the monorepo's prerelease flag) and publish the matching channel.
+#     - monorepo prerelease=true  -> we publish the ODD-minor rc VSIX (--pre-release)
+#     - monorepo prerelease=false -> we publish the EVEN-minor stable VSIX
+#   * PHASE 2 (promote): the monorepo later FLIPS that SAME release to
+#     non-prerelease (promotion). Fire `monorepo-vsx-promote` -> promote-on-flip.yml
+#     flips OUR release to released and publishes the stable VSIX. No new human PR:
+#     the stable asset + its sha256 were already reviewed in the phase-1 marker.
 #
 # Why this needs no new credentials:
 #   * The monorepo's releases are public, so `gh release ...` uses only this repo's
 #     GITHUB_TOKEN — no external/cross-repo credential, no enterprise approval.
 #   * A repository_dispatch fired with GITHUB_TOKEN is EXEMPT from GitHub's
-#     recursion guard, so it DOES trigger the receiver (most GITHUB_TOKEN-fired
+#     recursion guard, so it DOES trigger the workers (most GITHUB_TOKEN-fired
 #     events are suppressed; repository_dispatch and workflow_dispatch are not).
 #
 # Why it is safe that the "message" is untrusted:
-#   * The dispatch payload only decides WHICH release to wake the receiver for.
-#     The receiver re-downloads the VSIX and re-verifies sha256 + SLSA build
-#     provenance from scratch and FAILS CLOSED. Trust comes from the attestation,
-#     never from this poll.
+#   * The dispatch payload only decides WHICH release + WHICH phase to wake a worker
+#     for. Each worker re-queries the monorepo release's authoritative isPrerelease
+#     + asset list, re-downloads every VSIX, and re-verifies sha256 + SLSA build
+#     provenance from scratch, failing closed. Trust is in the attestation, never in
+#     this poll — which is why the payload carries no sha256 and no prerelease flag.
 #
-# Idempotency — never re-raises a PR or re-publishes an already-handled release.
-# The poll wakes the receiver for a version ONLY if it is genuinely new; it skips if:
-#   * the release tag b2c-vs-extension@<version> already exists here (published), OR
-#   * a release PR for this version is MERGED (accepted — publish already handled), OR
-#   * a release PR for this version is OPEN (in flight), OR
-#   * a release PR for this version was CLOSED without merging (a maintainer
-#     declined it — we respect that and do not nag; reopen that PR to retry).
-# The state is read from PERMANENT PR history, not branch existence, so deleting a
-# release branch cannot cause a re-raise, and "closed after merge" (MERGED) is told
-# apart from "closed without merging" (CLOSED).
-# (Reinforced downstream: the receiver skips if the release exists and edits an
-# existing PR rather than duplicating it; the publishers use --skip-duplicate.)
+# Idempotency — never re-raises a PR, never re-publishes, never double-promotes.
+# The decision function per version keys off DURABLE state (our release's own
+# prerelease flag + permanent PR history), so re-runs converge:
+#   * our release exists and is non-prerelease  -> SKIP (fully done)
+#   * our release exists and is prerelease:
+#       - monorepo release now non-prerelease   -> PROMOTE (phase 2)
+#       - monorepo release still prerelease      -> SKIP (rc still baking)
+#   * no release yet, keyed on PERMANENT PR history for the release branch:
+#       - MERGED (accepted; release-on-merge in flight)  -> SKIP
+#       - OPEN   (in flight)                             -> SKIP
+#       - CLOSED (a maintainer declined; reopen to retry) -> SKIP
+#       - NONE   (genuinely new)                         -> RECEIVE (phase 1)
+# PR state is read from history, not branch existence, so deleting a release branch
+# cannot cause a re-raise, and "closed after merge" (MERGED) is told apart from
+# "closed without merging" (CLOSED). (Reinforced downstream: the workers skip if the
+# release already matches the target state; the publishers use --skip-duplicate.)
 
 on:
   schedule:
@@ -43,7 +59,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: 'Optional: force-check a specific version (e.g. 0.10.1). Leave empty to check the latest monorepo extension release.'
+        description: 'Optional: force-check a specific version (e.g. 1.0.3). Leave empty to sweep the latest monorepo extension release + any pending promotions.'
         required: false
         type: string
 
@@ -56,7 +72,7 @@ concurrency:
 
 jobs:
   poll:
-    name: Check monorepo for an unprocessed release
+    name: Check monorepo for releases to receive or promote
     runs-on: ubuntu-latest
     permissions:
       # contents: write is required by the POST /repos/{repo}/dispatches endpoint
@@ -64,15 +80,15 @@ jobs:
       # nothing, and neither trigger (schedule / workflow_dispatch) is reachable
       # from fork PRs — so this is not a fork-PR escalation vector.
       contents: write
-      # pull-requests: read lets the idempotency guard query PR history via
+      # pull-requests: read lets the decision function query PR history via
       # `gh pr list` (GraphQL repository.pullRequests). Read-only: the poll never
       # opens or edits a PR — that is the receiver's job. Once an explicit
       # permissions: block is set, every unlisted scope defaults to none, so this
-      # must be declared or the guard's PR query is denied.
+      # must be declared or the PR-history query is denied.
       pull-requests: read
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      # Same allowlisted source as the receiver. Overridable via repo variable for
+      # Same allowlisted source as every worker. Overridable via repo variable for
       # sandbox testing; falls back to the production monorepo.
       EXPECTED_MONOREPO: ${{ vars.EXPECTED_MONOREPO || 'SalesforceCommerceCloud/b2c-developer-tooling' }}
       THIS_REPO: ${{ github.repository }}
@@ -80,175 +96,150 @@ jobs:
       # interpolated into a run: line.
       IN_VERSION: ${{ github.event.inputs.version }}
     steps:
-      - name: Resolve target release from the monorepo
-        id: resolve
+      - name: Resolve monorepo releases and dispatch actions
+        env:
+          SERVER_URL: ${{ github.server_url }}
         run: |
           set -euo pipefail
           fail() { echo "::error::$1"; exit 1; }
 
+          # --- helpers -----------------------------------------------------------
+          # isPrerelease of a release ("true"/"false"), or "absent" if it does not
+          # exist. Guarded so a missing release never trips `set -e`.
+          rel_prerelease() {
+            local repo="$1" tag="$2" out
+            if out=$(gh release view "$tag" --repo "$repo" --json isPrerelease --jq '.isPrerelease' 2>/dev/null); then
+              printf '%s' "$out"
+            else
+              printf 'absent'
+            fi
+          }
+
+          # Permanent PR-history state for a version's release branch. Exact
+          # headRefName match (via --arg) avoids the 0.1.1-vs-0.1.10 prefix
+          # collision a `test()` would suffer; --state all includes closed/merged.
+          pr_state() {
+            local branch="release/b2c-vs-extension-${1}"
+            gh pr list --repo "$THIS_REPO" --head "$branch" --state all \
+              --json state,headRefName \
+            | jq -r --arg b "$branch" \
+                'map(select(.headRefName == $b)) | if length == 0 then "NONE" else .[0].state end'
+          }
+
+          # Decide what this repo still needs to do for one version. Echoes exactly
+          # one of: receive | promote | skip. (Only the final echo reaches stdout;
+          # nested calls are captured, so the value is never polluted.)
+          decide() {
+            local version="$1" tag="b2c-vs-extension@${1}" bd mono
+            bd=$(rel_prerelease "$THIS_REPO" "$tag")
+            if [ "$bd" = "false" ]; then
+              echo skip; return                      # fully published already
+            fi
+            if [ "$bd" = "true" ]; then
+              # We already cut a prerelease for this version. Promote it iff the
+              # monorepo flipped its SAME release to non-prerelease.
+              mono=$(rel_prerelease "$EXPECTED_MONOREPO" "$tag")
+              if [ "$mono" = "false" ]; then echo promote; else echo skip; fi
+              return
+            fi
+            # No release yet -> consult permanent PR history. Anything but NONE means
+            # this version was already raised/declined; do not nag.
+            case "$(pr_state "$version")" in
+              NONE) echo receive ;;
+              *)    echo skip ;;
+            esac
+          }
+
+          # Fire the right repository_dispatch for a decided action. The payload is
+          # deliberately minimal — {version, repo, tag, url} — because the worker
+          # re-derives the prerelease flag, assets, and sha256 authoritatively from
+          # the monorepo release itself. jq --arg is injection-safe; POST via stdin.
+          dispatch() {
+            local version="$1" action="$2" tag="b2c-vs-extension@${1}" event url
+            case "$action" in
+              receive) event="monorepo-vsx-release" ;;
+              promote) event="monorepo-vsx-promote" ;;
+              *)       return ;;
+            esac
+            url="${SERVER_URL}/${EXPECTED_MONOREPO}/releases/tag/${tag}"
+            jq -n \
+              --arg version "$version" \
+              --arg repo "$EXPECTED_MONOREPO" \
+              --arg tag "$tag" \
+              --arg url "$url" \
+              --arg et "$event" \
+              '{
+                event_type: $et,
+                client_payload: {
+                  version: $version,
+                  monorepo_repo: $repo,
+                  monorepo_tag: $tag,
+                  release_url: $url
+                }
+              }' \
+            | gh api "repos/${THIS_REPO}/dispatches" --method POST --input -
+            echo "::notice::dispatched $event for $tag"
+          }
+
+          # --- build the candidate version set -----------------------------------
+          declare -A SEEN=()
+
           if [ -n "${IN_VERSION:-}" ]; then
-            # Manual fast-path: a specific version was requested. Validate its shape
-            # before it is used to build a tag/ref.
+            # Manual fast-path: a specific version. Validate its shape, then confirm
+            # the monorepo release exists before considering it.
             echo "$IN_VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$' \
               || fail "input version '$IN_VERSION' is not valid semver"
-            VERSION="$IN_VERSION"
-            TAG="b2c-vs-extension@${VERSION}"
-            # Confirm the release actually exists on the monorepo before waking the receiver.
-            gh release view "$TAG" --repo "$EXPECTED_MONOREPO" >/dev/null 2>&1 \
-              || fail "no release '$TAG' on $EXPECTED_MONOREPO"
+            gh release view "b2c-vs-extension@${IN_VERSION}" --repo "$EXPECTED_MONOREPO" >/dev/null 2>&1 \
+              || fail "no release 'b2c-vs-extension@${IN_VERSION}' on $EXPECTED_MONOREPO"
+            SEEN["$IN_VERSION"]=1
           else
-            # Scheduled path: pick the highest STABLE b2c-vs-extension version on the
-            # monorepo — by SEMVER, not publish date. Date order is unreliable (a late
-            # 0.9.5 hotfix cut after 0.10.1 would sort newest) and string order is
-            # wrong (0.10.10 < 0.10.9). Prereleases (e.g. 0.10.2-beta.1) are excluded:
-            # the marketplace path only promotes stable releases, and a lower already
-            # released version is caught by the idempotency guard below anyway.
+            # Scheduled path — two independent sources of candidates:
             #
-            # Enumerate ALL releases via the paginated REST API, NOT a bounded
-            # `gh release list --limit N`. That list returns only the newest N *by
-            # publish date* (--order desc = createdAt), so on a busy monorepo the
-            # true semver-max could sit just past the page boundary and be silently
-            # dropped — reintroducing exactly the date-vs-semver trap noted above. By
-            # paginating the complete set, ordering and truncation stop mattering:
-            # we compute the max over every release. (REST uses tag_name, snake_case.)
-            #
-            # Fail closed: this runs under `set -euo pipefail`, so a `gh api` error
-            # aborts the assignment rather than yielding an empty (falsely "no
-            # releases") result. The two-stage pipe — page-stream of tag names, then
-            # numeric semver-max — is order-independent by construction.
-            VERSION=$(gh api "repos/${EXPECTED_MONOREPO}/releases?per_page=100" \
-                --paginate --jq '.[].tag_name' \
-              | jq -R -s -r '
-                [ split("\n")[]
-                  | select(test("^b2c-vs-extension@[0-9]+\\.[0-9]+\\.[0-9]+$"))
-                  | sub("^b2c-vs-extension@";"") ]
-                | if length == 0 then empty
-                  else ( map(split(".") | map(tonumber)) | sort | last | map(tostring) | join(".") )
-                  end')
-            if [ -z "$VERSION" ]; then
-              echo "::notice::No stable b2c-vs-extension release found on $EXPECTED_MONOREPO; nothing to do"
-              echo "skip=true" >> "$GITHUB_OUTPUT"
-              exit 0
-            fi
-            TAG="b2c-vs-extension@${VERSION}"
+            # (1) Phase-2 SWEEP over OUR OWN prerelease releases. Every one is a
+            #     candidate so a promotion is caught even when a NEWER rc is still
+            #     baking above it — picking only the monorepo semver-max (below)
+            #     would shadow a lower, just-promoted version and never promote it.
+            while IFS= read -r v; do
+              [ -n "$v" ] && SEEN["$v"]=1
+            done < <(gh release list --repo "$THIS_REPO" --limit 100 \
+                       --json tagName,isPrerelease \
+                     | jq -r '.[]
+                              | select(.isPrerelease == true)
+                              | .tagName
+                              | select(test("^b2c-vs-extension@[0-9]+\\.[0-9]+\\.[0-9]+$"))
+                              | sub("^b2c-vs-extension@"; "")')
+
+            # (2) Phase-1: the newest monorepo extension release BY SEMVER over the
+            #     COMPLETE paginated set (not `--limit N`, which orders by date and
+            #     could drop the true max past a page boundary). In the build-once
+            #     model every extension tag is plain semver — both the direct-stable
+            #     path and the rc prerelease use `b2c-vs-extension@X.Y.Z` (nightly and
+            #     beta are npm-only and cut no release here), so this one regex
+            #     matches both channels and decide() routes each correctly. Multiple
+            #     simultaneous new releases are handled newest-first across polls; use
+            #     the manual `version` input to pull in a specific older one.
+            MAX=$(gh api "repos/${EXPECTED_MONOREPO}/releases?per_page=100" \
+                    --paginate --jq '.[].tag_name' \
+                  | jq -R -s -r '
+                    [ split("\n")[]
+                      | select(test("^b2c-vs-extension@[0-9]+\\.[0-9]+\\.[0-9]+$"))
+                      | sub("^b2c-vs-extension@"; "") ]
+                    | if length == 0 then empty
+                      else ( map(split(".") | map(tonumber)) | sort | last | map(tostring) | join(".") )
+                      end')
+            [ -n "$MAX" ] && SEEN["$MAX"]=1
           fi
 
-          echo "::notice::Target monorepo extension release: $TAG"
-          {
-            echo "skip=false"
-            echo "version=$VERSION"
-            echo "tag=$TAG"
-          } >> "$GITHUB_OUTPUT"
-
-      - name: Skip if already published or a release PR already exists
-        id: guard
-        if: steps.resolve.outputs.skip != 'true'
-        env:
-          VERSION: ${{ steps.resolve.outputs.version }}
-        run: |
-          set -euo pipefail
-          RELEASE_TAG="b2c-vs-extension@${VERSION}"
-          BRANCH="release/b2c-vs-extension-${VERSION}"
-
-          # (1) Already published in this repo? (Also covers a merged PR that has
-          # already produced the release tag.)
-          if gh release view "$RELEASE_TAG" --repo "$THIS_REPO" >/dev/null 2>&1; then
-            echo "::notice::Release $RELEASE_TAG already exists in $THIS_REPO; skipping (already published)"
-            echo "skip=true" >> "$GITHUB_OUTPUT"
+          if [ "${#SEEN[@]}" -eq 0 ]; then
+            echo "::notice::No candidate b2c-vs-extension releases on $EXPECTED_MONOREPO; nothing to do"
             exit 0
           fi
 
-          # (2) Has a release PR for this version ever existed? Query PERMANENT PR
-          # history for the exact release head branch — this survives branch
-          # deletion (so deleting a branch cannot cause a re-raise) and lets us tell
-          # MERGED apart from CLOSED-without-merge. Exact headRefName match avoids the
-          # 0.10.1-vs-0.10.10 prefix collision a name `test()` would suffer.
-          # --state all so closed/merged PRs are included, not just open ones.
-          # Pipe to the system `jq` (NOT gh's built-in --jq, which rejects --arg)
-          # so the exact-match binding via --arg works.
-          PR_STATE=$(gh pr list --repo "$THIS_REPO" --head "$BRANCH" --state all \
-            --json state,headRefName \
-          | jq -r --arg b "$BRANCH" \
-              'map(select(.headRefName == $b)) | if length == 0 then "NONE" else .[0].state end')
-
-          case "$PR_STATE" in
-            MERGED)
-              # Accepted and merged — release-on-merge handles publishing. If the
-              # release tag is missing that job is still in flight; do NOT re-wake.
-              echo "::notice::Release PR for $RELEASE_TAG was MERGED; publish is handled on-merge. Skipping."
-              echo "skip=true" >> "$GITHUB_OUTPUT"
-              exit 0 ;;
-            OPEN)
-              echo "::notice::Release PR for $RELEASE_TAG is OPEN (in flight); skipping."
-              echo "skip=true" >> "$GITHUB_OUTPUT"
-              exit 0 ;;
-            CLOSED)
-              # A maintainer closed it WITHOUT merging — an explicit decline. Respect
-              # it: do not nag by re-raising every poll. To retry, reopen that PR (or
-              # trigger this workflow manually for the version once policy allows).
-              echo "::notice::Release PR for $RELEASE_TAG was CLOSED without merging (declined); skipping. Reopen the PR to retry."
-              echo "skip=true" >> "$GITHUB_OUTPUT"
-              exit 0 ;;
-            NONE)
-              echo "::notice::$RELEASE_TAG is new (no release, no prior release PR); will wake the receiver."
-              echo "skip=false" >> "$GITHUB_OUTPUT" ;;
-            *)
-              echo "::error::Unexpected PR state '$PR_STATE' for $BRANCH; failing closed (not waking receiver)."
-              exit 1 ;;
-          esac
-
-      - name: Download VSIX and compute sha256
-        id: sha
-        if: steps.resolve.outputs.skip != 'true' && steps.guard.outputs.skip != 'true'
-        env:
-          TAG: ${{ steps.resolve.outputs.tag }}
-        run: |
-          set -euo pipefail
-          # Compute the integrity anchor the receiver expects in the payload, exactly
-          # as the monorepo's push would have supplied it. The receiver re-downloads
-          # and re-verifies this (and the SLSA provenance) independently — this value
-          # is the "expected", not the source of trust.
-          gh release download "$TAG" \
-            --repo "$EXPECTED_MONOREPO" \
-            --pattern '*.vsix' \
-            --dir /tmp/vsix
-          COUNT=$(ls /tmp/vsix/*.vsix 2>/dev/null | wc -l | tr -d ' ')
-          [ "$COUNT" -eq 1 ] || { echo "::error::expected exactly one .vsix on ${EXPECTED_MONOREPO}@${TAG}, found $COUNT"; exit 1; }
-          VSIX=$(ls /tmp/vsix/*.vsix)
-          SHA=$(sha256sum "$VSIX" | awk '{print $1}')
-          echo "::notice::VSIX sha256: $SHA"
-          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
-
-      - name: Wake the receiver (fire repository_dispatch to self)
-        if: steps.resolve.outputs.skip != 'true' && steps.guard.outputs.skip != 'true'
-        env:
-          VERSION: ${{ steps.resolve.outputs.version }}
-          TAG: ${{ steps.resolve.outputs.tag }}
-          VSIX_SHA256: ${{ steps.sha.outputs.sha }}
-          SERVER_URL: ${{ github.server_url }}
-        run: |
-          set -euo pipefail
-          RELEASE_URL="${SERVER_URL}/${EXPECTED_MONOREPO}/releases/tag/${TAG}"
-
-          # Build the SAME client_payload shape the monorepo push would send, so
-          # receive-monorepo-release.yml handles it via one unchanged code path.
-          # jq --arg is injection-safe; POST via stdin.
-          jq -n \
-            --arg version "$VERSION" \
-            --arg repo "$EXPECTED_MONOREPO" \
-            --arg tag "$TAG" \
-            --arg url "$RELEASE_URL" \
-            --arg sha "$VSIX_SHA256" \
-            '{
-              event_type: "monorepo-vsx-release",
-              client_payload: {
-                version: $version,
-                monorepo_repo: $repo,
-                monorepo_tag: $tag,
-                release_url: $url,
-                vsix_sha256: $sha
-              }
-            }' \
-          | gh api "repos/${THIS_REPO}/dispatches" --method POST --input -
-
-          echo "::notice::Dispatched monorepo-vsx-release for ${TAG} to ${THIS_REPO}"
+          # --- decide + dispatch each candidate ----------------------------------
+          # Fail closed: this whole step runs under `set -euo pipefail`, so a `gh`
+          # error aborts (and the next cron retries) rather than silently skipping.
+          for v in "${!SEEN[@]}"; do
+            action=$(decide "$v")
+            echo "::notice::b2c-vs-extension@${v} -> ${action}"
+            dispatch "$v" "$action"
+          done

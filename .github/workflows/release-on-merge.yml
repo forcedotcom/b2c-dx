@@ -1,5 +1,20 @@
 name: Create release on merge
 
+# Phase 1 of the build-once lifecycle on the b2c-dx side. Fires when a reviewed
+# release PR merges (releases/latest.json changes on main). It reads the committed
+# marker, re-verifies EVERY VSIX it names (sha256 + SLSA, fail closed), then creates
+# ONE b2c-dx release that MIRRORS the monorepo release's prerelease flag and carries
+# every VSIX asset:
+#   * monorepo prerelease=true  (rc build-once) -> create a PRE-RELEASE here holding
+#     both the odd-minor rc VSIX and the even-minor stable VSIX; dispatch the
+#     publishers with channel=prerelease (they publish the rc VSIX --pre-release).
+#     The stable VSIX rides along so promote-on-flip.yml can publish it later from
+#     THIS release without a rebuild.
+#   * monorepo prerelease=false (direct-stable) -> create a normal release holding
+#     the single stable VSIX; dispatch the publishers with channel=stable.
+# Phase 2 (flip + publish stable for an rc) is handled by promote-on-flip.yml, not
+# here — this workflow only ever runs on a PR merge.
+
 on:
   push:
     branches: [main]
@@ -48,7 +63,7 @@ jobs:
           VERSION=$(jq -r '.version // empty' releases/latest.json)
           MONOREPO_TAG=$(jq -r '.monorepoTag // empty' releases/latest.json)
           MONOREPO_REPO=$(jq -r '.monorepoRepo // empty' releases/latest.json)
-          VSIX_SHA256=$(jq -r '.vsixSha256 // empty' releases/latest.json)
+          MONO_PRERELEASE=$(jq -r '.monorepoPrerelease // empty' releases/latest.json)
 
           if [ -z "$VERSION" ] || [ -z "$MONOREPO_TAG" ] || [ -z "$MONOREPO_REPO" ]; then
             echo "::notice::releases/latest.json has null version/tag/repo (sentinel state); nothing to release"
@@ -63,9 +78,27 @@ jobs:
             exit 1
           fi
 
-          # Integrity anchor must be present and well-formed.
-          echo "$VSIX_SHA256" | grep -Eq '^[a-f0-9]{64}$' \
-            || { echo "::error::marker vsixSha256 is missing or malformed"; exit 1; }
+          # The prerelease flag drives whether we create a prerelease and which
+          # channel publishes on merge. Must be a strict boolean from the marker.
+          if [ "$MONO_PRERELEASE" != "true" ] && [ "$MONO_PRERELEASE" != "false" ]; then
+            echo "::error::marker monorepoPrerelease is missing or not a boolean ('$MONO_PRERELEASE')"
+            exit 1
+          fi
+
+          # Phase-1 channel: an rc (monorepo prerelease) publishes the pre-release
+          # channel on merge; a direct-stable release publishes stable.
+          if [ "$MONO_PRERELEASE" = "true" ]; then
+            CHANNEL="prerelease"
+          else
+            CHANNEL="stable"
+          fi
+
+          # At least the channel we are about to publish must be present + well
+          # formed in the marker (sha256 shape). The other channel may be absent
+          # (direct-stable has no prerelease channel).
+          CH_SHA=$(jq -r --arg c "$CHANNEL" '.channels[$c].vsixSha256 // empty' releases/latest.json)
+          echo "$CH_SHA" | grep -Eq '^[a-f0-9]{64}$' \
+            || { echo "::error::marker channels.$CHANNEL.vsixSha256 is missing or malformed"; exit 1; }
 
           # Skip if version is unchanged from the previous commit (e.g. metadata-only edits).
           PREV=$(git show HEAD~1:releases/latest.json 2>/dev/null | jq -r '.version // empty' || true)
@@ -89,57 +122,52 @@ jobs:
             echo "release_tag=$RELEASE_TAG"
             echo "monorepo_tag=$MONOREPO_TAG"
             echo "monorepo_repo=$MONOREPO_REPO"
-            echo "vsix_sha256=$VSIX_SHA256"
+            echo "mono_prerelease=$MONO_PRERELEASE"
+            echo "channel=$CHANNEL"
             echo "skip=false"
           } >> "$GITHUB_OUTPUT"
 
-      - name: Download VSIX from monorepo release
+      - name: Download and verify every VSIX named in the marker — fail closed
+        id: assets
         if: steps.marker.outputs.skip != 'true'
         env:
           MONOREPO_TAG: ${{ steps.marker.outputs.monorepo_tag }}
           MONOREPO_REPO: ${{ steps.marker.outputs.monorepo_repo }}
         run: |
           set -euo pipefail
-          gh release download "$MONOREPO_TAG" \
-            --repo "$MONOREPO_REPO" \
-            --pattern '*.vsix' \
-            --dir .
-          VSIX=$(ls *.vsix 2>/dev/null | head -n1)
-          if [ -z "$VSIX" ]; then
-            echo "::error::No .vsix asset found on ${MONOREPO_REPO}@${MONOREPO_TAG}"
-            exit 1
-          fi
-          echo "Downloaded $VSIX"
-          echo "VSIX=$VSIX" >> "$GITHUB_ENV"
+          fail() { echo "::error::$1"; exit 1; }
 
-      - name: Verify VSIX integrity (sha256) — fail closed
-        if: steps.marker.outputs.skip != 'true'
-        env:
-          EXPECTED_SHA: ${{ steps.marker.outputs.vsix_sha256 }}
-        run: |
-          set -euo pipefail
-          ACTUAL_SHA=$(sha256sum "$VSIX" | awk '{print $1}')
-          if [ "$ACTUAL_SHA" != "$EXPECTED_SHA" ]; then
-            echo "::error::VSIX sha256 mismatch. expected=$EXPECTED_SHA actual=$ACTUAL_SHA"
-            exit 1
-          fi
-          echo "::notice::VSIX sha256 verified: $ACTUAL_SHA"
+          mkdir -p dist-vsix
+          # Verify each channel present in the committed marker: download that exact
+          # file from the monorepo release, check its sha256 against the marker, and
+          # re-verify SLSA build provenance. Every named VSIX is staged into
+          # dist-vsix/ to be attached to the b2c-dx release.
+          for channel in prerelease stable; do
+            FILE=$(jq -r --arg c "$channel" '.channels[$c].vsixFile // empty' releases/latest.json)
+            [ -n "$FILE" ] || continue
+            EXPECTED_SHA=$(jq -r --arg c "$channel" '.channels[$c].vsixSha256 // empty' releases/latest.json)
+            echo "$EXPECTED_SHA" | grep -Eq '^[a-f0-9]{64}$' \
+              || fail "marker channels.$channel.vsixSha256 malformed"
 
-      - name: Verify build provenance (SLSA attestation) — trust anchor, fail closed
-        if: steps.marker.outputs.skip != 'true'
-        env:
-          MONOREPO_REPO: ${{ steps.marker.outputs.monorepo_repo }}
-        run: |
-          set -euo pipefail
-          # This is the machine check that compensates for the human PR review
-          # (which only sees metadata). A tampered or foreign VSIX cannot reach
-          # release creation — and therefore cannot reach the marketplaces.
-          # --source-ref pins the git ref so only artifacts built+attested from
-          # the monorepo's main branch pass (see receive-monorepo-release.yml).
-          gh attestation verify "$VSIX" \
-            --repo "$MONOREPO_REPO" \
-            --signer-workflow "${MONOREPO_REPO}/.github/workflows/publish.yml" \
-            --source-ref refs/heads/main
+            gh release download "$MONOREPO_TAG" \
+              --repo "$MONOREPO_REPO" \
+              --pattern "$FILE" \
+              --dir dist-vsix
+            [ -f "dist-vsix/$FILE" ] || fail "asset '$FILE' (channel $channel) not found on ${MONOREPO_REPO}@${MONOREPO_TAG}"
+
+            ACTUAL_SHA=$(sha256sum "dist-vsix/$FILE" | awk '{print $1}')
+            [ "$ACTUAL_SHA" = "$EXPECTED_SHA" ] \
+              || fail "VSIX sha256 mismatch for $FILE (channel $channel): marker=$EXPECTED_SHA actual=$ACTUAL_SHA"
+
+            # This is the machine check that compensates for the human PR review
+            # (which only sees metadata). A tampered or foreign VSIX cannot reach
+            # release creation — and therefore cannot reach the marketplaces.
+            gh attestation verify "dist-vsix/$FILE" \
+              --repo "$MONOREPO_REPO" \
+              --signer-workflow "${MONOREPO_REPO}/.github/workflows/publish.yml" \
+              --source-ref refs/heads/main
+            echo "::notice::verified $channel VSIX $FILE ($ACTUAL_SHA)"
+          done
 
       - name: Extract changelog section for release notes
         if: steps.marker.outputs.skip != 'true'
@@ -147,6 +175,7 @@ jobs:
           VERSION: ${{ steps.marker.outputs.version }}
           MONOREPO_REPO: ${{ steps.marker.outputs.monorepo_repo }}
           MONOREPO_TAG: ${{ steps.marker.outputs.monorepo_tag }}
+          MONO_PRERELEASE: ${{ steps.marker.outputs.mono_prerelease }}
         run: |
           set -euo pipefail
           awk '
@@ -157,8 +186,17 @@ jobs:
             printf '## B2C DX VS Code Extension v%s\n\n' "$VERSION"
             printf 'Source release: [%s@%s](https://github.com/%s/releases/tag/%s)\n\n' \
               "$MONOREPO_REPO" "$MONOREPO_TAG" "$MONOREPO_REPO" "$MONOREPO_TAG"
-            printf 'Install via:\n```\ncode --install-extension b2c-vs-extension-%s.vsix\n```\n\n' "$VERSION"
-            printf 'Or in VS Code: Extensions → ⋯ → Install from VSIX...\n\n---\n\n### Changelog\n\n'
+            if [ "$MONO_PRERELEASE" = "true" ]; then
+              printf '_Release candidate: the pre-release VSIX is published to the Marketplace pre-release channel now; the stable VSIX rides this release and is published on promotion._\n\n'
+            fi
+            printf '### Marketplace artifacts\n\n'
+            printf '| Channel | Marketplace version | File |\n|---|---|---|\n'
+            for channel in prerelease stable; do
+              f=$(jq -r --arg c "$channel" '.channels[$c].vsixFile // empty' releases/latest.json)
+              mv=$(jq -r --arg c "$channel" '.channels[$c].marketplaceVersion // empty' releases/latest.json)
+              [ -n "$f" ] && printf '| %s | `%s` | `%s` |\n' "$channel" "$mv" "$f"
+            done
+            printf '\n---\n\n### Changelog\n\n'
             cat /tmp/release-notes.md
           } > /tmp/full-release-notes.md
 
@@ -167,33 +205,49 @@ jobs:
         env:
           RELEASE_TAG: ${{ steps.marker.outputs.release_tag }}
           VERSION: ${{ steps.marker.outputs.version }}
+          MONO_PRERELEASE: ${{ steps.marker.outputs.mono_prerelease }}
         run: |
           set -euo pipefail
+          # Mirror the monorepo's prerelease flag. An rc becomes a PRE-RELEASE here
+          # (so the `released` event does not fire for it — the publishers run only
+          # via the explicit channel dispatch below, and promote-on-flip later flips
+          # this same release to stable). A direct-stable release is created normally.
+          FLAGS=()
+          if [ "$MONO_PRERELEASE" = "true" ]; then
+            FLAGS+=(--prerelease --latest=false)
+          else
+            FLAGS+=(--latest)
+          fi
           gh release create "$RELEASE_TAG" \
             --repo "${{ github.repository }}" \
             --title "VS Code Extension ${VERSION}" \
             --notes-file /tmp/full-release-notes.md \
-            "$VSIX"
+            "${FLAGS[@]}" \
+            dist-vsix/*.vsix
 
-      # A `release` event created with GITHUB_TOKEN does NOT trigger other workflows
-      # (GitHub's recursion guard). workflow_dispatch is one of the two exceptions,
-      # so explicitly dispatch the publishers and pass the tag. Each publisher
+      # A release created with GITHUB_TOKEN does NOT trigger other workflows
+      # (GitHub's recursion guard), and a prerelease fires no `released` event at
+      # all. workflow_dispatch is one of the two guard exceptions, so explicitly
+      # dispatch the publishers and pass the phase-1 channel. Each publisher
       # re-verifies the VSIX provenance before it touches a marketplace.
       - name: Trigger marketplace publish workflows
         if: steps.marker.outputs.skip != 'true'
         env:
           RELEASE_TAG: ${{ steps.marker.outputs.release_tag }}
+          CHANNEL: ${{ steps.marker.outputs.channel }}
         run: |
           set -euo pipefail
           gh workflow run publish-vscode.yml \
             --repo "${{ github.repository }}" \
             --ref main \
-            -f tag="$RELEASE_TAG"
+            -f tag="$RELEASE_TAG" \
+            -f channel="$CHANNEL"
           gh workflow run publish-openvsx.yml \
             --repo "${{ github.repository }}" \
             --ref main \
-            -f tag="$RELEASE_TAG"
-          echo "::notice::Dispatched publish-vscode and publish-openvsx for $RELEASE_TAG"
+            -f tag="$RELEASE_TAG" \
+            -f channel="$CHANNEL"
+          echo "::notice::Dispatched publish-vscode and publish-openvsx for $RELEASE_TAG (channel=$CHANNEL)"
 
   # ---------------------------------------------------------------------------
   # Change Traffic Control (CTC) — OPTIONAL, INERT BY DEFAULT.
