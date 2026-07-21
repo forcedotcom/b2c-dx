@@ -189,6 +189,11 @@ jobs:
         env:
           SLACK_WEBHOOK_URL: ${{ secrets.IDEE_MAIN_SLACK_WEBHOOK }}
         with:
+          # v2+/v3 require the webhook type explicitly. IDEE_MAIN_SLACK_WEBHOOK is a
+          # classic Slack incoming webhook and `payload` below is Block Kit, so this
+          # is 'incoming-webhook' (not 'webhook-trigger', which is for Workflow
+          # Builder). Without this input the action fails before posting.
+          webhook-type: incoming-webhook
           payload: |
             {
               "text": "${{ github.event.inputs.slack-notification-title || '🎉 Extensions Released Successfully!' }}",
@@ -230,6 +235,11 @@ jobs:
         env:
           SLACK_WEBHOOK_URL: ${{ secrets.IDEE_MAIN_SLACK_WEBHOOK }}
         with:
+          # v2+/v3 require the webhook type explicitly. IDEE_MAIN_SLACK_WEBHOOK is a
+          # classic Slack incoming webhook and `payload` below is Block Kit, so this
+          # is 'incoming-webhook' (not 'webhook-trigger', which is for Workflow
+          # Builder). Without this input the action fails before posting.
+          webhook-type: incoming-webhook
           payload: |
             {
               "text": "❌ VS Code Marketplace publish failed",
