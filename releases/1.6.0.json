@@ -1,0 +1,7 @@
+{
+  "version": "1.6.0",
+  "monorepoTag": "b2c-vs-extension@1.6.0",
+  "monorepoRepo": "SalesforceCommerceCloud/b2c-developer-tooling",
+  "monorepoReleaseUrl": "https://github.com/SalesforceCommerceCloud/b2c-developer-tooling/releases/tag/b2c-vs-extension@1.6.0",
+  "vsixSha256": "dafc8370d3e80a92c5aa93a5a392babda00495885c3e50c0e794ffd2370baaf1"
+}
